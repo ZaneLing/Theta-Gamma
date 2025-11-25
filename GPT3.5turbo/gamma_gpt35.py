@@ -1,5 +1,5 @@
 # gamma.py
-# Gamma agent + LLM 工具封装
+# Gamma agent + LLM utilities
 
 import os
 import json
@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 def load_dotenv(path: str = ".env") -> None:
     """
-    简单 .env 加载：KEY=VALUE 行
+    Minimal .env loader that reads KEY=VALUE per line.
     """
     if not os.path.exists(path):
         return
@@ -32,10 +32,10 @@ def load_dotenv(path: str = ".env") -> None:
 
 def extract_json_from_text(text: str) -> Dict[str, Any]:
     """
-    从 LLM 输出中鲁棒提取 JSON：
-    - 先整体解析；若是 list 则取最后一个 dict
-    - 针对 <think>/<analysis> 块先剥离
-    - 若仍失败，提取文本中的最后一个 {...}
+    Robustly extract a JSON object from an LLM response:
+    - Try loading the full string; if it's a list take the last dict.
+    - Strip <think>/<analysis> reasoning blocks and retry.
+    - If it still fails, pull the last {...} substring in the text.
     """
     def _strip_reasoning_blocks(raw: str) -> str:
         cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
@@ -71,13 +71,13 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
 
 class LLMClient:
     """
-    封装 OpenRouter / OpenAI GPT-3.5 Turbo chat API
+    Thin wrapper around the OpenRouter / OpenAI GPT-3.5 Turbo chat API.
     """
 
     def __init__(self, call_log: Optional[List[Dict[str, Any]]] = None):
         load_dotenv()
         self.api_url = os.getenv("API_URL", "https://openrouter.ai/api/v1/chat/completions")
-        # 默认使用 OpenRouter 的 GPT-3.5 Turbo 标识
+        # Default to OpenRouter GPT-3.5 Turbo identifier
         self.model_name = os.getenv("MODEL_NAME", "openai/gpt-3.5-turbo")
         self.api_key = os.getenv("OPENROUTER_API_KEY", os.getenv("OPENAI_API_KEY", ""))
         self.call_log: List[Dict[str, Any]] = call_log if call_log is not None else []
@@ -131,13 +131,13 @@ class LLMClient:
                 if attempt == MAX_RETRY:
                     raise e
                 print(f"[LLMClient] Timeout or error, retrying ({attempt}/{MAX_RETRY})...")
-                time.sleep(3)  # 等3秒继续 retry
+                time.sleep(3)  # wait 3 seconds then retry
 
 
 
 class GammaAgent:
     """
-    Gamma agent：负责在 facts 中找线索 + 局部回答
+    Gamma agent: search within facts and answer subquestions.
     """
 
     def __init__(self, dataset_name: str, llm_client: LLMClient):
@@ -145,7 +145,7 @@ class GammaAgent:
         self.dataset_name = dataset_name
         self.llm = llm_client
 
-    # ---------- 不同数据集构造 facts ----------
+    # ---------- Build facts for different datasets ----------
 
     def _build_facts_2wiki(self, example: Dict[str, Any]) -> List[Dict[str, Any]]:
         facts: List[Dict[str, Any]] = []
@@ -191,7 +191,7 @@ class GammaAgent:
             return self._build_facts_musique(example)
         raise ValueError(f"Unknown dataset: {self.dataset_name}")
 
-    # ---------- 对单个子问题进行检索 + 回答 ----------
+    # ---------- Retrieve + answer a single subquestion ----------
 
     def answer_subquestion(
         self,
@@ -267,7 +267,7 @@ Respond with JSON ONLY:
         try:
             obj = extract_json_from_text(raw_text)
             if isinstance(obj, list):
-                # 有些模型可能返回单元素列表，取最后一个 dict
+                # Some models may return a single-element list; take the last dict
                 obj = next((item for item in reversed(obj) if isinstance(item, dict)), {})
             if not isinstance(obj, dict):
                 obj = {}

@@ -1,197 +1,188 @@
-# theta.py
-# Theta agent：控制主节律 + 调用 Gamma，并计算六个指标
+# theta_gpt35.py
+# Theta agent: orchestrates Gamma calls, applies ACC self-check, question schema, and returns trace.
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import re
-import string
-from collections import Counter
 
 from gamma_gpt35 import LLMClient, GammaAgent, extract_json_from_text
-
-
-def normalize_answer(s: str) -> str:
-    """
-    SQuAD 风格答案归一化
-    """
-    def remove_articles(text: str) -> str:
-        return re.sub(r"\b(a|an|the)\b", " ", text)
-
-    def white_space_fix(text: str) -> str:
-        return " ".join(text.split())
-
-    def remove_punc(text: str) -> str:
-        exclude = set(string.punctuation)
-        return "".join(ch for ch in text if ch not in exclude)
-
-    def lower(text: str) -> str:
-        return text.lower()
-
-    s = s or ""
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
+from acc_gpt35 import ACCAgent
 
 
 class ThetaAgent:
     """
     Theta agent:
-    - 规划子问题（theta）
-    - 按需调度 gamma
-    - 整合最终答案
-    - 计算 answer / support 六个指标
+    - Question schema analysis (task type, answer role, entities)
+    - Plan subquestions (theta)
+    - Dispatch gamma as needed
+    - Dynamically rewrite later subquestions using previous answers
+    - Integrate the final answer (with symbolic comparator hints)
+    - Call ACC for lightweight self-check
+    - Return full trace (for logging / analysis)
     """
 
     def __init__(self, dataset_name: str, llm_client: LLMClient):
         assert dataset_name in {"2wiki", "hotpotqa", "musique"}
         self.dataset_name = dataset_name
+        self.acc = ACCAgent(dataset_name=dataset_name, llm_client=llm_client)
         self.llm = llm_client
         self.gamma = GammaAgent(dataset_name=dataset_name, llm_client=llm_client)
 
-    # ---------- 答案指标 ----------
+        # 当前样本的问题 schema 缓存（避免重复推一次）
+        self._schema_question: Optional[str] = None
+        self._schema: Optional[Dict[str, Any]] = None
 
-    def answer_em(self, pred: str, golds: List[str]) -> float:
-        if not pred or not golds:
-            return 0.0
-        npred = normalize_answer(pred)
-        for g in golds:
-            if npred == normalize_answer(g):
-                return 1.0
-        return 0.0
+    # ---------- Question Schema 构建 ----------
 
-    def answer_f1(self, pred: str, golds: List[str]) -> float:
-        if not golds:
-            return 0.0
-        pred_tokens = normalize_answer(pred).split()
-        best = 0.0
-        for g in golds:
-            gold_tokens = normalize_answer(g).split()
-            if not pred_tokens and not gold_tokens:
-                f1 = 1.0
-            elif not pred_tokens or not gold_tokens:
-                f1 = 0.0
-            else:
-                common = Counter(pred_tokens) & Counter(gold_tokens)
-                num_same = sum(common.values())
-                if num_same == 0:
-                    f1 = 0.0
-                else:
-                    prec = num_same / len(pred_tokens)
-                    rec = num_same / len(gold_tokens)
-                    f1 = 2 * prec * rec / (prec + rec)
-            if f1 > best:
-                best = f1
-        return best
-
-    # ---------- 支持集（support）指标 ----------
-
-    def get_gold_support_indices(self, example: Dict[str, Any]) -> List[int]:
+    def _ensure_schema(self, question: str) -> Dict[str, Any]:
         """
-        把不同数据集的 supporting facts 统一成 “fact index” 集合：
-        - 2wiki: supporting_facts: [[title, sent_id], ...]，映射到 context 里 title 的索引
-        - hotpotqa: supporting_facts: {"title": [...], "sent_id": [...]}
-        - musique: question_decomposition[*]["paragraph_support_idx"]
+        Ensure that self._schema is built for this question.
         """
-        if self.dataset_name == "2wiki":
-            title_to_idx = {}
-            for idx, pair in enumerate(example.get("context", [])):
-                if not isinstance(pair, list) or len(pair) < 1:
-                    continue
-                title = pair[0]
-                title_to_idx[title] = idx
-            indices = set()
-            for title, sent_id in example.get("supporting_facts", []):
-                if title in title_to_idx:
-                    indices.add(title_to_idx[title])
-            return sorted(indices)
+        if self._schema is not None and self._schema_question == question:
+            return self._schema
+        schema = self.build_question_schema(question)
+        self._schema_question = question
+        self._schema = schema
+        return schema
 
-        if self.dataset_name == "hotpotqa":
-            ctx = example.get("context", {})
-            titles = ctx.get("title", [])
-            title_to_idx = {t: i for i, t in enumerate(titles)}
-            indices = set()
-            sf = example.get("supporting_facts", {})
-            if isinstance(sf, dict):
-                st = sf.get("title", [])
-                for t in st:
-                    if t in title_to_idx:
-                        indices.add(title_to_idx[t])
-            else:
-                # 兼容 list[[title, sent_id], ...] 格式
-                for t, sid in sf:
-                    if t in title_to_idx:
-                        indices.add(title_to_idx[t])
-            return sorted(indices)
+    def build_question_schema(self, question: str) -> Dict[str, Any]:
+        """
+        构造一个轻量 Question Schema：
+        - question_type: yes_no / comparison / fact / count / other
+        - answer_form: yes_no / entity_name / number / date / span / other
+        - focus: 人 / 电影 / 地点 / 机构 / other（仅提示用）
+        - entities: [{"name": ..., "type": ..., "role": ...}, ...]
+        - constraints / notes: 任务规则 & 其他说明
+        """
+        prompt = f"""
+You are a QUESTION SCHEMA ANALYZER for a multi-hop QA system (THETA-GAMMA).
 
-        if self.dataset_name == "musique":
-            indices = set()
-            for qd in example.get("question_decomposition", []):
-                if "paragraph_support_idx" in qd:
-                    indices.add(int(qd["paragraph_support_idx"]))
-            return sorted(indices)
+Given the ORIGINAL QUESTION, you must produce a compact schema that describes:
+- The task type (yes/no, comparison, fact lookup, count, etc.).
+- The expected answer form (yes/no, entity name, number, date, etc.).
+- The main entities involved and their roles.
+- Any key constraints or multi-hop structure.
 
-        return []
+CRITICAL:
+Return a SINGLE JSON object with keys:
+  - "question_type": one of ["yes_no", "comparison", "fact", "count", "other"]
+  - "answer_form": one of ["yes_no", "entity_name", "number", "date", "span", "other"]
+  - "focus": short phrase for what the answer is about (e.g., "film", "person", "city", "organization", "generic").
+  - "entities": array of objects, each:
+        {{
+          "name": string,              # surface form in the question if any
+          "type": string,              # e.g., "person", "film", "city", "organization", "other"
+          "role": string               # e.g., "subject", "candidate1", "candidate2", "pivot", "target"
+        }}
+  - "constraints": array of short strings describing important logical conditions.
+  - "notes": short English description of how the question should be solved and what the final answer must look like.
 
-    def compute_support_metrics(
-        self,
-        pred_indices: List[int],
-        gold_indices: List[int],
-    ) -> Dict[str, float]:
-        pset = set(pred_indices)
-        gset = set(gold_indices)
+Example output:
+{{
+  "question_type": "comparison",
+  "answer_form": "entity_name",
+  "focus": "film",
+  "entities": [
+    {{"name": "Charge It To Me", "type": "film", "role": "candidate1"}},
+    {{"name": "Danger: Diabolik", "type": "film", "role": "candidate2"}},
+    {{"name": "", "type": "person", "role": "director"}}
+  ],
+  "constraints": [
+    "compare which director is younger",
+    "answer must be the film whose director is younger"
+  ],
+  "notes": "Two-hop: find each film's director, then compare their ages and answer with the film title."
+}}
 
-        # 两边都空 -> 认为 perfect
-        if not pset and not gset:
-            return {
-                "support_em": 1.0,
-                "support_precision": 1.0,
-                "support_recall": 1.0,
-                "support_f1": 1.0,
-            }
+ORIGINAL QUESTION:
+{question}
 
-        tp = len(pset & gset)
-        precision = tp / len(pset) if pset else 0.0
-        recall = tp / len(gset) if gset else 0.0
-        if precision + recall > 0:
-            f1 = 2 * precision * recall / (precision + recall)
-        else:
-            f1 = 0.0
-        em = 1.0 if pset == gset and bool(gset) else 0.0
+Respond with JSON ONLY:
+""".strip()
 
-        return {
-            "support_em": em,
-            "support_precision": precision,
-            "support_recall": recall,
-            "support_f1": f1,
+        raw_text = self.llm.generate(
+            prompt,
+            meta={
+                "agent": "theta",
+                "kind": "question_schema",
+                "dataset": self.dataset_name,
+            },
+            temperature=0.2,
+        )
+
+        # 容错解析
+        try:
+            obj = extract_json_from_text(raw_text)
+            if not isinstance(obj, dict):
+                raise ValueError("schema must be an object")
+        except Exception:
+            obj = {}
+
+        # 填默认值，避免下游 KeyError
+        schema: Dict[str, Any] = {
+            "question_type": obj.get("question_type", "other"),
+            "answer_form": obj.get("answer_form", "other"),
+            "focus": obj.get("focus", "generic"),
+            "entities": obj.get("entities", []),
+            "constraints": obj.get("constraints", []),
+            "notes": obj.get("notes", ""),
+            "raw_json": obj,
         }
+        return schema
 
-    # ---------- gold 答案 ----------
+    def _schema_summary(self, schema: Dict[str, Any]) -> str:
+        """
+        把 schema 转成短文本，方便塞进 prompt 作为 hint
+        """
+        qtype = schema.get("question_type", "other")
+        ans_form = schema.get("answer_form", "other")
+        focus = schema.get("focus", "generic")
+        ents = schema.get("entities", [])
+        cons = schema.get("constraints", [])
+        notes = schema.get("notes", "")
 
-    def get_gold_answers(self, example: Dict[str, Any]) -> List[str]:
-        golds: List[str] = []
-        aliases = example.get("answer_aliases")
-        if isinstance(aliases, list) and aliases:
-            golds.extend([str(a) for a in aliases])
-        if "answer" in example:
-            golds.append(str(example["answer"]))
+        ent_lines = []
+        for e in ents:
+            name = (e.get("name") or "").strip()
+            etype = (e.get("type") or "other").strip()
+            role = (e.get("role") or "other").strip()
+            ent_lines.append(f"- {role}: '{name}' ({etype})")
 
-        uniq: List[str] = []
-        seen = set()
-        for g in golds:
-            key = normalize_answer(g)
-            if key not in seen:
-                uniq.append(g)
-                seen.add(key)
-        return uniq
+        ent_block = "\n".join(ent_lines) if ent_lines else "  (no explicit entities parsed)"
+        cons_block = "\n".join(f"- {c}" for c in cons) if cons else "  (no explicit constraints)"
+        notes_block = notes or "(no extra notes)"
 
-    # ---------- 阶段 1：theta 拆子问题 ----------
+        return (
+            f"Question type: {qtype}\n"
+            f"Answer form: {ans_form}\n"
+            f"Answer focus: {focus}\n"
+            f"Entities:\n{ent_block}\n"
+            f"Constraints:\n{cons_block}\n"
+            f"Notes: {notes_block}"
+        )
+
+    # ---------- Stage 1: theta decomposes the question ----------
 
     def plan_subquestions(self, question: str, max_steps: int = 4) -> List[str]:
+        # 确保有 schema
+        schema = self._ensure_schema(question)
+        schema_summary = self._schema_summary(schema)
+
         prompt = f"""
 You are the THETA agent in a dual-agent multi-hop reasoning system.
 
-Your job:
-1. Read the original QUESTION.
-2. Decompose it into 2 to {max_steps} ordered SUBQUESTIONS.
-   - Each subquestion should be a simple fact-based question.
-   - Later, the GAMMA agent will try to fetch evidence for each subquestion.
+FIRST, read the QUESTION_SCHEMA (already analyzed for you).
+Then, decompose the ORIGINAL QUESTION into 2 to {max_steps} ordered SUBQUESTIONS.
+
+Guidelines:
+- Each subquestion should be a simple fact-based question.
+- The sequence of subquestions should follow the schema:
+  - Respect the question_type and constraints.
+  - Ensure that the LAST subquestion directly prepares the information needed
+    to produce the final answer in the required ANSWER_FORM.
+- Do NOT answer the question here; only plan subquestions.
+
+QUESTION_SCHEMA (for reference, DO NOT rewrite it):
+{schema_summary}
 
 CRITICAL OUTPUT:
 - Respond with a SINGLE JSON object.
@@ -204,11 +195,11 @@ Example:
     "Who directed the film 'Move (1970 film)'?",
     "What country is that director from?",
     "Who directed 'Méditerranée (1963 film)'?",
-    "What country is that director from, and are they the same?"
+    "What country is that director from?"
   ]
 }}
 
-QUESTION:
+ORIGINAL QUESTION:
 {question}
 
 Respond with JSON ONLY:
@@ -234,19 +225,157 @@ Respond with JSON ONLY:
         except Exception:
             return [question]
 
-    # ---------- 阶段 2：theta 整合最终答案 ----------
+    def refine_subquestion(
+        self,
+        question: str,
+        planned_subquestion: str,
+        previous_steps: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Rewrite the planned_subquestion using earlier Gamma answers to be more specific,
+        while respecting the QUESTION_SCHEMA (answer role, entity alignment).
+        If no reliable answer yet (found=false or answer empty), keep it unchanged.
+        """
+        if not previous_steps:
+            return planned_subquestion
+
+        schema = self._ensure_schema(question)
+        schema_summary = self._schema_summary(schema)
+
+        # Summarize previous steps
+        lines = []
+        for step in previous_steps:
+            gres = step.get("gamma_result", {}) or {}
+            lines.append(
+                f"step {step.get('step_index')}: subquestion='{step.get('refined_subquestion', step.get('subquestion'))}', "
+                f"found={gres.get('found')}, answer={gres.get('answer')}"
+            )
+        history_block = "\n".join(lines)
+
+        prompt = f"""
+You are the THETA agent refining the next subquestion in a multi-hop QA task.
+
+You MUST:
+- Use the QUESTION_SCHEMA to preserve entity alignment and answer role.
+- Use PREVIOUS STEPS (gamma answers) to rewrite the NEXT_SUBQUESTION to be as specific as possible
+  (e.g., replace pronouns like "that director" with the actual name if confidently known).
+- If previous steps did NOT find a reliable answer (found=false or empty answer), KEEP the next subquestion unchanged.
+
+QUESTION_SCHEMA:
+{schema_summary}
+
+PREVIOUS STEPS:
+{history_block}
+
+NEXT_SUBQUESTION (planned):
+{planned_subquestion}
+
+CRITICAL OUTPUT:
+- Respond with a SINGLE JSON object:
+  - "subquestion": string (the rewritten subquestion to ask gamma)
+
+Respond with JSON ONLY:
+""".strip()
+
+        raw_text = self.llm.generate(
+            prompt,
+            meta={
+                "agent": "theta",
+                "kind": "refine_subquestion",
+                "dataset": self.dataset_name,
+            },
+            temperature=0.2,
+        )
+
+        try:
+            obj = extract_json_from_text(raw_text)
+            refined = obj.get("subquestion", "").strip()
+            return refined if refined else planned_subquestion
+        except Exception:
+            return planned_subquestion
+
+    # ---------- Stage 2: symbolic comparator + answer integration ----------
+
+    def _extract_years(self, text: str) -> List[int]:
+        years: List[int] = []
+        for m in re.findall(r"(1[5-9]\d{2}|20\d{2})", text or ""):
+            try:
+                years.append(int(m))
+            except Exception:
+                continue
+        return years
+
+    def build_symbolic_schema(self, question: str, gamma_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Lightweight symbolic comparator / numeric hints:
+        - detect comparative keywords (older/younger/earlier/later/before/after).
+        - extract numeric cues (years) from gamma answers and selected facts.
+        - provide a compact hint string for LLM to avoid small comparison slips.
+        """
+        comparative_keywords = [
+            "older", "younger", "earlier", "later", "before", "after",
+            "first", "second", "younger than", "older than", "earlier than", "later than",
+        ]
+        q_lower = question.lower()
+        hits = [kw for kw in comparative_keywords if kw in q_lower]
+        is_comp = bool(hits)
+
+        entities = []
+        for step in gamma_results:
+            gres = step.get("gamma_result", {}) or {}
+            answer = str(gres.get("answer", "") or "")
+            years = set(self._extract_years(answer))
+            for ft in gres.get("selected_fact_texts", []) or []:
+                years.update(self._extract_years(str(ft)))
+            entities.append({
+                "step": step.get("step_index"),
+                "subq": step.get("refined_subquestion") or step.get("subquestion"),
+                "answer": answer,
+                "years": sorted(years),
+            })
+
+        # Build a human-readable summary to feed into prompts
+        lines = []
+        if is_comp:
+            lines.append(f"Comparative keywords detected: {', '.join(hits)}.")
+        else:
+            lines.append("No obvious comparative keywords detected.")
+        for ent in entities:
+            ytxt = ", ".join(str(y) for y in ent["years"]) if ent["years"] else "none"
+            lines.append(f"Step {ent['step']}: answer='{ent['answer']}', years=[{ytxt}].")
+        summary = "\n".join(lines)
+
+        return {
+            "is_comparative": is_comp,
+            "keywords": hits,
+            "entities": entities,
+            "summary": summary,
+        }
 
     def integrate_answer(
         self,
         question: str,
         gamma_results: List[Dict[str, Any]],
+        comparator_summary: str = "",
     ) -> Dict[str, Any]:
+        """
+        把 question schema + gamma 结果 + 符号比较提示 三者一起喂给 LLM，
+        明确要求它：
+        - 回答形式要符合 schema.answer_form；
+        - 如果是 yes/no，就只回答 yes / no；
+        - 如果是 “which film/person...”，就输出对应实体，而不是中间推理节点。
+        """
+        schema = self._ensure_schema(question)
+        schema_summary = self._schema_summary(schema)
+
         lines = []
         for i, gr in enumerate(gamma_results, start=1):
-            gres = gr.get("gamma_result", {})
+            gres = gr.get("gamma_result", {}) or {}
+            asked_subq = gr.get("refined_subquestion") or gr.get("subquestion")
             lines.append(
                 f"Step {i}:\n"
-                f"  subquestion: {gr.get('subquestion')}\n"
+                f"  subquestion: {asked_subq}\n"
+                f"  planned_subquestion: {gr.get('subquestion')}\n"
                 f"  gamma_found: {gres.get('found')}\n"
                 f"  gamma_answer: {gres.get('answer')}\n"
                 f"  gamma_reasoning: {gres.get('reasoning')}\n"
@@ -255,25 +384,28 @@ Respond with JSON ONLY:
         gamma_summary = "\n\n".join(lines)
 
         prompt = f"""
-You are the THETA agent. You have received evidence from the GAMMA agent for a multi-hop question.
+You are the THETA agent. You must produce a FINAL ANSWER to the ORIGINAL QUESTION
+based on GAMMA's evidence, the QUESTION_SCHEMA, and the SYMBOLIC_COMPARATOR hints.
 
-Your tasks:
-1. Carefully read the ORIGINAL QUESTION.
-2. Review the GAMMA_RESULTS (each step's subquestion, whether gamma found an answer, and gamma's answer).
-3. Produce a FINAL_ANSWER: a short phrase/text that directly answers the original question.
-4. Provide a short REASONING summary (1-3 sentences in English) explaining how you used the gamma results.
+STRICT RULES:
+1. Respect QUESTION_SCHEMA.answer_form:
+   - If "yes_no": the answer MUST be exactly "yes" or "no".
+   - If "entity_name": the answer MUST be the name of the required entity (film/person/city/etc.),
+     NOT a description, NOT an explanation, and NOT an intermediate node.
+   - If "number" or "date": output ONLY the number or date required.
+2. Your reasoning text should match the final answer logically.
+3. Do NOT change the task type. If the question asks for a FILM, do NOT answer with a PERSON.
 
 CRITICAL OUTPUT:
-- Respond with a SINGLE JSON object.
-- JSON keys:
+- Respond with a SINGLE JSON object:
   - "answer": string
-  - "reasoning": string
+  - "reasoning": string (1-3 sentences in English)
 
-Example:
-{{
-  "answer": "no",
-  "reasoning": "One director is American and the other is French, so they are not from the same country."
-}}
+QUESTION_SCHEMA:
+{schema_summary}
+
+SYMBOLIC_COMPARATOR_HINTS:
+{comparator_summary}
 
 ORIGINAL QUESTION:
 {question}
@@ -318,7 +450,7 @@ Respond with JSON ONLY:
             "raw_json": obj,
         }
 
-    # ---------- 总流程：解答一个样本并返回所有信息 ----------
+    # ---------- Full pipeline: solve one example and return all details ----------
 
     def solve_one(
         self,
@@ -331,20 +463,33 @@ Respond with JSON ONLY:
         else:
             ex_id = example.get("id", f"{self.dataset_name}_{example_index}")
 
-        gold_answers = self.get_gold_answers(example)
+        # 0) 先构建 Question Schema（让后续都在这个 frame 下运转）
+        schema = self._ensure_schema(question)
+        schema_summary = self._schema_summary(schema)  # 纯 log 用
 
-        # 1) theta: 拆子问题
+        # 1) theta: plan subquestions
         subquestions = self.plan_subquestions(question)
         gamma_results: List[Dict[str, Any]] = []
+        executed_subquestions: List[str] = []
 
         gamma_call_count = 0
         gamma_success_count = 0
         for step_idx, subq in enumerate(subquestions, start=1):
+            refined_subq = (
+                self.refine_subquestion(
+                    question=question,
+                    planned_subquestion=subq,
+                    previous_steps=gamma_results,
+                )
+                if step_idx > 1
+                else subq
+            )
+            executed_subquestions.append(refined_subq)
             call_id = f"{ex_id}_step{step_idx}"
             gamma_call_count += 1
             gr = self.gamma.answer_subquestion(
                 example=example,
-                subquestion=subq,
+                subquestion=refined_subq,
                 call_id=call_id,
             )
             if gr.get("found"):
@@ -353,39 +498,43 @@ Respond with JSON ONLY:
                 {
                     "step_index": step_idx,
                     "subquestion": subq,
+                    "refined_subquestion": refined_subq,
                     "gamma_result": gr,
                 }
             )
 
-        # 2) theta: 整合最终答案
-        final = self.integrate_answer(question, gamma_results)
-        predicted_answer = final.get("answer", "").strip()
+        # 2) Symbolic comparator / question schema (PFC+parietal helper)
+        comparator = self.build_symbolic_schema(question, gamma_results)
+        comparator_summary = comparator.get("summary", "") if comparator.get("is_comparative") else ""
 
-        # 3) 答案指标
-        ans_em = self.answer_em(predicted_answer, gold_answers)
-        ans_f1 = self.answer_f1(predicted_answer, gold_answers)
+        # 3) theta: integrate a preliminary answer (with comparator & schema hints)
+        final = self.integrate_answer(question, gamma_results, comparator_summary=comparator_summary)
+        initial_answer = final.get("answer", "")
+        if not isinstance(initial_answer, str):
+            initial_answer = str(initial_answer)
+        initial_answer = initial_answer.strip()
 
-        # 4) 支持集指标
-        gold_support = self.get_gold_support_indices(example)
-        pred_support: List[int] = []
-        seen = set()
-        for gr in gamma_results:
-            for idx in gr.get("gamma_result", {}).get("selected_fact_indices", []):
-                if idx not in seen:
-                    seen.add(idx)
-                    pred_support.append(idx)
-
-        support_metric_vals = self.compute_support_metrics(pred_support, gold_support)
+        # 4) ACC self-check: detect logical/entity issues and optionally revise
+        acc_result = self.acc.check_answer(
+            question=question,
+            gamma_results=gamma_results,
+            initial_answer=initial_answer,
+        )
+        predicted_answer = acc_result.get("final_answer", "") or initial_answer
 
         # 5) trace + log
         trace = {
-            "subquestions": subquestions,
+            "question_schema": schema,
+            "question_schema_summary": schema_summary,
+            "planned_subquestions": subquestions,
+            "executed_subquestions": executed_subquestions,
             "gamma_results": gamma_results,
-            "theta_final": final,
+            "theta_final": final,              # Theta raw integration
+            "theta_initial_answer": initial_answer,
+            "acc_result": acc_result,          # ACC self-check details
             "gamma_call_count": gamma_call_count,
             "gamma_success_count": gamma_success_count,
-            "predicted_support_indices": pred_support,
-            "gold_support_indices": gold_support,
+            "symbolic_comparator": comparator,
         }
 
         llm_calls = getattr(self.llm, "call_log", [])
@@ -395,16 +544,8 @@ Respond with JSON ONLY:
             "example_index": example_index,
             "id": ex_id,
             "question": question,
-            "gold_answers": gold_answers,
+            "theta_answer": initial_answer,     # Theta answer before ACC
             "predicted_answer": predicted_answer,
-            # 六个指标
-            "answer_em": ans_em,
-            "answer_f1": ans_f1,
-            "support_em": support_metric_vals["support_em"],
-            "support_f1": support_metric_vals["support_f1"],
-            "support_precision": support_metric_vals["support_precision"],
-            "support_recall": support_metric_vals["support_recall"],
-            # 详细轨迹
             "theta_gamma_trace": trace,
             "llm_calls": llm_calls,
         }

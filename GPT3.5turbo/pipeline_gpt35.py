@@ -1,5 +1,5 @@
 # pipeline.py
-# 控制整体流程，跑 2Wiki / HotpotQA / MuSiQue，并统计六个指标
+# Controls the end-to-end run over 2Wiki / HotpotQA / MuSiQue and reports six metrics
 
 import os
 import json
@@ -10,21 +10,29 @@ from tqdm import tqdm
 
 from gamma_gpt35 import LLMClient
 from theta_gpt35 import ThetaAgent
+from metrics_gpt35 import (
+    get_gold_answers,
+    get_gold_support_indices,
+    answer_em,
+    answer_f1,
+    compute_support_metrics,
+    extract_predicted_support_indices,
+)
 
 from dotenv import load_dotenv
 load_dotenv()
 
 DATASET_FILES = {
-    "2wiki": "2wiki_500.json",
-    "hotpotqa": "hotpotqa_500.json",
-    "musique": "musique_500.json",
+    "2wiki": "./Data/2wiki_500.json",
+    "hotpotqa": "./Data/hotpotqa_500.json",
+    "musique": "./Data/musique_500.json",
 }
 
 
 def ensure_gpt35_default() -> None:
     """
-    如果用户未在 .env 或环境变量中指定模型，默认用 OpenRouter 的 GPT-3.5 Turbo。
-    同时提示需要设置 OPENROUTER_API_KEY 或 OPENAI_API_KEY。
+    If MODEL_NAME is not set, default to OpenRouter GPT-3.5 Turbo.
+    Also reminds users to set OPENROUTER_API_KEY or OPENAI_API_KEY.
     """
     os.environ["MODEL_NAME"] = "openai/gpt-3.5-turbo"
 
@@ -39,12 +47,12 @@ def load_dataset(path: str) -> List[Dict[str, Any]]:
 
 def load_processed_indices(log_path: str) -> Tuple[List[Dict[str, Any]], Set[int], Dict[str, float]]:
     """
-    从日志文件中加载已处理的样本索引、已有结果列表和累积指标
+    Load processed sample indices, existing results, and accumulated metrics from a log file.
     
-    返回:
-        existing_results: 已有的结果列表（JSON 数组或从旧的 JSONL 合并）
-        processed_indices: 已处理的样本索引集合
-        accumulated_metrics: 累积的指标值
+    Returns:
+        existing_results: list of existing results (JSON array or merged from legacy JSONL)
+        processed_indices: set of processed sample indices
+        accumulated_metrics: accumulated metric sums
     """
     existing_results: List[Dict[str, Any]] = []
     processed_indices: Set[int] = set()
@@ -66,7 +74,7 @@ def load_processed_indices(log_path: str) -> Tuple[List[Dict[str, Any]], Set[int
         if not content:
             return existing_results, processed_indices, accumulated_metrics
 
-        # 支持 JSON 数组（推荐）与 JSONL（兼容旧格式）两种形式
+        # Support JSON array (preferred) or JSONL (legacy)
         if content.lstrip().startswith("["):
             try:
                 loaded = json.loads(content)
@@ -92,7 +100,7 @@ def load_processed_indices(log_path: str) -> Tuple[List[Dict[str, Any]], Set[int
             if idx is None:
                 continue
             processed_indices.add(int(idx))
-            # 累积指标
+            # accumulate metrics
             accumulated_metrics["sum_answer_em"] += float(result.get("answer_em", 0.0))
             accumulated_metrics["sum_answer_f1"] += float(result.get("answer_f1", 0.0))
             accumulated_metrics["sum_support_em"] += float(result.get("support_em", 0.0))
@@ -114,6 +122,7 @@ def run_dataset(
     ensure_gpt35_default()
     os.makedirs(log_dir, exist_ok=True)
     out_path = os.path.join(log_dir, f"theta_gamma_{dataset_name}.jsonl")
+    verbose_log_path = os.path.join(log_dir, f"theta_gamma_{dataset_name}_verbose.log")
 
     if limit is not None and limit > 0:
         eval_data = data[:limit]
@@ -125,14 +134,14 @@ def run_dataset(
         print(f"[{dataset_name}] No examples to run.")
         return
 
-    # 加载已处理的样本、已有结果和累积指标
+    # Load processed samples, existing results, and accumulated metrics
     _, processed_indices, accumulated_metrics = load_processed_indices(out_path)
     processed_count = len(processed_indices)
     
     if processed_count > 0:
-        print(f"[{dataset_name}] 发现已处理 {processed_count}/{total} 个样本，将从断点继续...")
+        print(f"[{dataset_name}] Found {processed_count}/{total} processed samples, resuming from checkpoint...")
     
-    # 六个指标的累积和（从已处理的样本中恢复）
+    # Accumulated sums for six metrics (restored from processed samples)
     sum_answer_em = accumulated_metrics["sum_answer_em"]
     sum_answer_f1 = accumulated_metrics["sum_answer_f1"]
     sum_support_em = accumulated_metrics["sum_support_em"]
@@ -140,15 +149,15 @@ def run_dataset(
     sum_support_prec = accumulated_metrics["sum_support_prec"]
     sum_support_rec = accumulated_metrics["sum_support_rec"]
 
-    # 过滤出需要处理的样本
+    # Filter remaining samples to process
     remaining_data = [(idx, ex) for idx, ex in enumerate(eval_data) if idx not in processed_indices]
     remaining_count = len(remaining_data)
     
     if remaining_count == 0:
-        print(f"[{dataset_name}] 所有样本已处理完成，无需继续运行。")
+        print(f"[{dataset_name}] All samples already processed. Nothing to do.")
         return
 
-    # 使用 tqdm 创建进度条，只遍历需要处理的样本
+    # Progress bar over remaining samples
     pbar = tqdm(
         remaining_data,
         total=total,
@@ -158,16 +167,41 @@ def run_dataset(
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
     )
     
-    current_processed = processed_count  # 当前已处理的样本总数
+    current_processed = processed_count  # running count of processed samples
 
-    # 追加写入 JSONL，避免整文件重写
+    # Append to JSONL to avoid rewriting the whole file
     with open(out_path, "a", encoding="utf-8") as fout:
+        vlog = open(verbose_log_path, "a", encoding="utf-8")
         for idx, ex in pbar:
             call_log: List[Dict[str, Any]] = []
             llm_client = LLMClient(call_log=call_log)
             theta = ThetaAgent(dataset_name=dataset_name, llm_client=llm_client)
 
             result = theta.solve_one(ex, example_index=idx)
+
+            # Compute metrics outside Theta
+            gold_answers = get_gold_answers(ex)
+            pred_answer = result.get("predicted_answer", "")
+            ans_em_val = answer_em(dataset_name, pred_answer, gold_answers)
+            ans_f1_val = answer_f1(pred_answer, gold_answers)
+
+            gold_support = get_gold_support_indices(dataset_name, ex)
+            gamma_results = result.get("theta_gamma_trace", {}).get("gamma_results", [])
+            pred_support = extract_predicted_support_indices(gamma_results)
+            support_vals = compute_support_metrics(pred_support, gold_support)
+
+            # Attach metrics and gold info
+            result.update({
+                "gold_answers": gold_answers,
+                "answer_em": ans_em_val,
+                "answer_f1": ans_f1_val,
+                "support_em": support_vals["support_em"],
+                "support_f1": support_vals["support_f1"],
+                "support_precision": support_vals["support_precision"],
+                "support_recall": support_vals["support_recall"],
+                "predicted_support_indices": pred_support,
+                "gold_support_indices": gold_support,
+            })
 
             sum_answer_em += float(result.get("answer_em", 0.0))
             sum_answer_f1 += float(result.get("answer_f1", 0.0))
@@ -177,12 +211,65 @@ def run_dataset(
             sum_support_rec += float(result.get("support_recall", 0.0))
 
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
-            fout.flush()  # 立即刷新，确保断点安全
+            fout.flush()  # flush immediately for checkpoint safety
 
-            # 更新已处理的样本数
+            # ---- Human-readable log: per-question view question / theta->gamma / gamma->theta / final decision ----
+            trace = result.get("theta_gamma_trace", {})
+            gamma_steps = trace.get("gamma_results", [])
+            final = trace.get("theta_final", {})
+            acc = trace.get("acc_result", {}) or {}
+            comparator = trace.get("symbolic_comparator", {}) or {}
+            gold = result.get("gold_answers", [])
+            status = "✅" if float(result.get("answer_em", 0.0)) == 1.0 else "❌"
+            theta_ans = result.get("theta_answer")
+            acc_verdict = acc.get("verdict")
+            acc_final = acc.get("final_answer")
+            acc_changed = (str(acc_final).strip() != str(theta_ans).strip()) if theta_ans is not None else False
+
+            log_lines: List[str] = []
+            log_lines.append(f"==== Example {idx} ====")
+            log_lines.append(f"Question: {result.get('question')}")
+            for step in gamma_steps:
+                planned = step.get("subquestion", "")
+                refined = step.get("refined_subquestion") or planned
+                gres = step.get("gamma_result", {}) or {}
+                log_lines.append(
+                    f"[Theta -> Gamma] step {step.get('step_index')}: {refined} (planned: {planned})"
+                )
+                log_lines.append(
+                    f"[Gamma -> Theta] found={gres.get('found')} answer={gres.get('answer')} "
+                    f"reason={gres.get('reasoning')} used_facts={gres.get('selected_fact_indices')}"
+                )
+            # Question schema / comparator hints (if present)
+            if comparator:
+                log_lines.append(
+                    f"[Schema] comparative={comparator.get('is_comparative')} "
+                    f"keywords={comparator.get('keywords')} "
+                    f"summary={comparator.get('summary', '').replace(chr(10), ' / ')}"
+                )
+            # Theta's own integrated answer (before ACC)
+            log_lines.append(
+                f"[Theta answer] {result.get('theta_answer')}"
+            )
+            # ACC self-check
+            log_lines.append(
+                f"[ACC] verdict={acc_verdict} final_answer={acc_final} "
+                f"flags={acc.get('flags')} "
+                f"revised={'yes' if acc_changed else 'no-op'}"
+            )
+            log_lines.append(f"[ACC] explanation: {acc.get('explanation')}")
+            log_lines.append(
+                f"[Theta final] answer={result.get('predicted_answer')} (gold={gold}) status={status}"
+            )
+            log_lines.append(f"Reasoning: {final.get('reasoning', '')}")
+            log_lines.append("")  # separator
+            vlog.write("\n".join(log_lines))
+            vlog.flush()
+
+            # Update processed count
             current_processed += 1
             
-            # 每个样本都更新进度条，显示当前平均指标
+            # Update progress bar with running averages
             if current_processed > 0:
                 pbar.set_postfix({
                     "ans_EM": f"{sum_answer_em/current_processed:.3f}",
@@ -207,7 +294,7 @@ def run_dataset(
 
 
 def main():
-    default_data_dir = Path(__file__).resolve().parent.parent  # 仓库根目录
+    default_data_dir = Path(__file__).resolve().parent.parent  # repo root
     parser = argparse.ArgumentParser(
         description="Theta-Gamma dual-agent pipeline for 2Wiki / HotpotQA / MuSiQue"
     )
