@@ -22,10 +22,32 @@ from metrics_gpt35 import (
 from dotenv import load_dotenv
 load_dotenv()
 
-DATASET_FILES = {
-    "2wiki": "./Data/2wiki_500.json",
-    "hotpotqa": "./Data/hotpotqa_500.json",
-    "musique": "./Data/musique_500.json",
+DATASET_CONFIG = {
+    "2wiki": {
+        "path": "./Data/2wiki_500.json",
+        "theta_dataset": "2wiki",
+    },
+    "hotpotqa": {
+        "path": "./Data/hotpotqa_500.json",
+        "theta_dataset": "hotpotqa",
+    },
+    "musique": {
+        "path": "./Data/musique_500.json",
+        "theta_dataset": "musique",
+    },
+    # Musique train splits with different hop counts (all share musique schema)
+    "musique2hop": {
+        "path": "./Data/musique_ans_train_2hop_samples.json",
+        "theta_dataset": "musique",
+    },
+    "musique3hop": {
+        "path": "./Data/musique_ans_train_3hop_samples.json",
+        "theta_dataset": "musique",
+    },
+    "musique4hop": {
+        "path": "./Data/musique_ans_train_4hop_samples.json",
+        "theta_dataset": "musique",
+    },
 }
 
 
@@ -45,7 +67,7 @@ def load_dataset(path: str) -> List[Dict[str, Any]]:
     return data
 
 
-def load_processed_indices(log_path: str) -> Tuple[List[Dict[str, Any]], Set[int], Dict[str, float]]:
+def load_processed_indices(log_path: str) -> Tuple[List[Dict[str, Any]], Set[int], Dict[str, float], int]:
     """
     Load processed sample indices, existing results, and accumulated metrics from a log file.
     
@@ -64,15 +86,16 @@ def load_processed_indices(log_path: str) -> Tuple[List[Dict[str, Any]], Set[int
         "sum_support_prec": 0.0,
         "sum_support_rec": 0.0,
     }
-    
+    skipped_count = 0
+
     if not os.path.exists(log_path):
-        return existing_results, processed_indices, accumulated_metrics
-    
+        return existing_results, processed_indices, accumulated_metrics, skipped_count
+
     try:
         with open(log_path, "r", encoding="utf-8") as f:
             content = f.read().strip()
         if not content:
-            return existing_results, processed_indices, accumulated_metrics
+            return existing_results, processed_indices, accumulated_metrics, skipped_count
 
         # Support JSON array (preferred) or JSONL (legacy)
         if content.lstrip().startswith("["):
@@ -100,6 +123,9 @@ def load_processed_indices(log_path: str) -> Tuple[List[Dict[str, Any]], Set[int
             if idx is None:
                 continue
             processed_indices.add(int(idx))
+            if result.get("skipped"):
+                skipped_count += 1
+                continue
             # accumulate metrics
             accumulated_metrics["sum_answer_em"] += float(result.get("answer_em", 0.0))
             accumulated_metrics["sum_answer_f1"] += float(result.get("answer_f1", 0.0))
@@ -109,14 +135,15 @@ def load_processed_indices(log_path: str) -> Tuple[List[Dict[str, Any]], Set[int
             accumulated_metrics["sum_support_rec"] += float(result.get("support_recall", 0.0))
     except Exception as e:
         print(f"Warning: Failed to load processed indices from {log_path}: {e}")
-    
-    return existing_results, processed_indices, accumulated_metrics
+
+    return existing_results, processed_indices, accumulated_metrics, skipped_count
 
 
 def run_dataset(
     dataset_name: str,
     data: List[Dict[str, Any]],
     log_dir: str,
+    theta_dataset: str,
     limit: int = -1,
 ) -> None:
     ensure_gpt35_default()
@@ -135,7 +162,7 @@ def run_dataset(
         return
 
     # Load processed samples, existing results, and accumulated metrics
-    _, processed_indices, accumulated_metrics = load_processed_indices(out_path)
+    _, processed_indices, accumulated_metrics, skipped_count = load_processed_indices(out_path)
     processed_count = len(processed_indices)
     
     if processed_count > 0:
@@ -175,17 +202,50 @@ def run_dataset(
         for idx, ex in pbar:
             call_log: List[Dict[str, Any]] = []
             llm_client = LLMClient(call_log=call_log)
-            theta = ThetaAgent(dataset_name=dataset_name, llm_client=llm_client)
+            theta = ThetaAgent(dataset_name=theta_dataset, llm_client=llm_client)
 
             result = theta.solve_one(ex, example_index=idx)
+
+            if result.get("skipped"):
+                skipped_count += 1
+                # 标记样本已跳过，写入日志方便后续追溯
+                result.setdefault("example_index", idx)
+                result.setdefault("question", ex.get("question", ""))
+                result["dataset"] = dataset_name
+                fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+                fout.flush()
+                skip_stage = result.get("skip_stage", "schema")
+                resp_body = (result.get("skip_error_body") or "").strip()
+                question_txt = result.get("question", "")
+                vlog_lines = [
+                    f"==== Example {idx} ====",
+                    f"[SKIPPED {skip_stage}] {result.get('skip_reason')}",
+                    f"Question: {question_txt}",
+                ]
+                if resp_body:
+                    vlog_lines.append(f"Response body: {resp_body}")
+                vlog_lines.append("")  # separator
+                vlog.write("\n".join(vlog_lines) + "\n")
+                vlog.flush()
+                current_processed += 1
+                if current_processed > 0:
+                    answered_count = current_processed - skipped_count
+                    if answered_count > 0:
+                        pbar.set_postfix({
+                            "ans_EM": f"{sum_answer_em/answered_count:.3f}",
+                            "ans_F1": f"{sum_answer_f1/answered_count:.3f}",
+                            "sup_EM": f"{sum_support_em/answered_count:.3f}",
+                            "sup_F1": f"{sum_support_f1/answered_count:.3f}"
+                        })
+                continue
 
             # Compute metrics outside Theta
             gold_answers = get_gold_answers(ex)
             pred_answer = result.get("predicted_answer", "")
-            ans_em_val = answer_em(dataset_name, pred_answer, gold_answers)
+            ans_em_val = answer_em(theta_dataset, pred_answer, gold_answers)
             ans_f1_val = answer_f1(pred_answer, gold_answers)
 
-            gold_support = get_gold_support_indices(dataset_name, ex)
+            gold_support = get_gold_support_indices(theta_dataset, ex)
             gamma_results = result.get("theta_gamma_trace", {}).get("gamma_results", [])
             pred_support = extract_predicted_support_indices(gamma_results)
             support_vals = compute_support_metrics(pred_support, gold_support)
@@ -222,7 +282,7 @@ def run_dataset(
             gold = result.get("gold_answers", [])
             status = "✅" if float(result.get("answer_em", 0.0)) == 1.0 else "❌"
             theta_ans = result.get("theta_answer")
-            acc_verdict = acc.get("verdict")
+            acc_action = acc.get("action")
             acc_final = acc.get("final_answer")
             acc_changed = (str(acc_final).strip() != str(theta_ans).strip()) if theta_ans is not None else False
 
@@ -253,7 +313,7 @@ def run_dataset(
             )
             # ACC self-check
             log_lines.append(
-                f"[ACC] verdict={acc_verdict} final_answer={acc_final} "
+                f"[ACC] action={acc_action} final_answer={acc_final} "
                 f"flags={acc.get('flags')} "
                 f"revised={'yes' if acc_changed else 'no-op'}"
             )
@@ -271,25 +331,31 @@ def run_dataset(
             
             # Update progress bar with running averages
             if current_processed > 0:
-                pbar.set_postfix({
-                    "ans_EM": f"{sum_answer_em/current_processed:.3f}",
-                    "ans_F1": f"{sum_answer_f1/current_processed:.3f}",
-                    "sup_EM": f"{sum_support_em/current_processed:.3f}",
-                    "sup_F1": f"{sum_support_f1/current_processed:.3f}"
-                })
+                answered_count = current_processed - skipped_count
+                if answered_count > 0:
+                    pbar.set_postfix({
+                        "ans_EM": f"{sum_answer_em/answered_count:.3f}",
+                        "ans_F1": f"{sum_answer_f1/answered_count:.3f}",
+                        "sup_EM": f"{sum_support_em/answered_count:.3f}",
+                        "sup_F1": f"{sum_support_f1/answered_count:.3f}"
+                    })
 
-    n = float(total)
-    print(f"[{dataset_name}] DONE on {total} examples.")
-    print(
-        f"  answer_em = {sum_answer_em/n:.4f}, "
-        f"answer_f1 = {sum_answer_f1/n:.4f}"
-    )
-    print(
-        f"  support_em = {sum_support_em/n:.4f}, "
-        f"support_f1 = {sum_support_f1/n:.4f}, "
-        f"support_precision = {sum_support_prec/n:.4f}, "
-        f"support_recall = {sum_support_rec/n:.4f}"
-    )
+    answered_total = total - skipped_count
+    print(f"[{dataset_name}] DONE on {total} examples (answered {answered_total}, skipped {skipped_count}).")
+    if answered_total > 0:
+        n = float(answered_total)
+        print(
+            f"  answer_em = {sum_answer_em/n:.4f}, "
+            f"answer_f1 = {sum_answer_f1/n:.4f}"
+        )
+        print(
+            f"  support_em = {sum_support_em/n:.4f}, "
+            f"support_f1 = {sum_support_f1/n:.4f}, "
+            f"support_precision = {sum_support_prec/n:.4f}, "
+            f"support_recall = {sum_support_rec/n:.4f}"
+        )
+    else:
+        print("  No answered samples; all skipped during schema stage.")
     print(f"  Results saved to: {out_path}")
 
 
@@ -308,7 +374,8 @@ def main():
         "--datasets",
         type=str,
         default="2wiki,hotpotqa,musique",
-        help="Comma-separated list of datasets: 2wiki,hotpotqa,musique",
+        help="Comma-separated list of datasets: "
+             "2wiki, hotpotqa, musique, musique2hop, musique3hop, musique4hop",
     )
     parser.add_argument(
         "--limit",
@@ -326,12 +393,20 @@ def main():
     args = parser.parse_args()
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
 
+    data_dir = Path(args.data_dir).expanduser()
+    repo_root = Path(__file__).resolve().parent.parent
     for dataset_name in datasets:
-        if dataset_name not in DATASET_FILES:
+        if dataset_name not in DATASET_CONFIG:
             print(f"Unknown dataset: {dataset_name}, skip.")
             continue
-        data_dir = Path(args.data_dir).expanduser()
-        data_path = data_dir / DATASET_FILES[dataset_name]
+        cfg = DATASET_CONFIG[dataset_name]
+        data_path = data_dir / cfg["path"]
+        if not data_path.exists():
+            # Fallback: try repo root (useful when running inside GPT3.5turbo/ but data lives at repo root Data/)
+            alt_path = repo_root / cfg["path"]
+            if alt_path.exists():
+                data_path = alt_path
+        theta_dataset = cfg.get("theta_dataset", dataset_name)
         if not os.path.exists(data_path):
             print(f"File not found for {dataset_name}: {data_path}, skip.")
             continue
@@ -340,7 +415,7 @@ def main():
         data = load_dataset(data_path)
 
         limit = args.limit if args.limit and args.limit > 0 else -1
-        run_dataset(dataset_name, data, log_dir=args.log_dir, limit=limit)
+        run_dataset(dataset_name, data, log_dir=args.log_dir, theta_dataset=theta_dataset, limit=limit)
 
 
 if __name__ == "__main__":

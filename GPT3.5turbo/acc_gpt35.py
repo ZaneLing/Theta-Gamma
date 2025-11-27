@@ -1,17 +1,17 @@
 # acc_gpt35.py
-# ACC = 前扣带皮层风格的“裁判 + 轻量编辑器”
+# ACC = Anterior Cingulate Cortex style “judge + lightweight editor”
 #
-# 设计原则：
-# 1. ACC 不再完整重答问题，而是只在以下有限 action 里选择：
-#    - KEEP: 保留 Theta 原答案
-#    - FLIP_BOOL: 翻转 yes/no
-#    - CHOOSE_FROM_CANDIDATES: 在候选集合中重新选一个
-#    - ANSWER_UNKNOWN: 明确标记证据不足
-# 2. ACC 不允许发明新实体，只能在候选集中选。
-# 3. ACC 主要职责是：
-#    - 发现明显冲突（同/不同国家、早/晚、生卒年比较等）
-#    - 在冲突明显时，做最小修改
-# 4. 所有决策和中间信息都写进 acc_result 方便后续分析。
+# Design principles:
+# 1. ACC never fully re-answers the question; it only chooses among limited actions:
+#    - KEEP: keep Theta’s original answer
+#    - FLIP_BOOL: flip yes/no
+#    - CHOOSE_FROM_CANDIDATES: pick one from the candidate set
+#    - ANSWER_UNKNOWN: explicitly mark insufficient evidence
+# 2. ACC must not invent new entities; it only chooses from the candidate set.
+# 3. ACC’s main duties:
+#    - detect obvious conflicts (same/different country, earlier/later, birth/death comparisons, etc.)
+#    - apply the smallest edit when conflict is clear
+# 4. All decisions and intermediate info are written into acc_result for later analysis.
 
 from typing import Any, Dict, List, Optional
 
@@ -30,12 +30,12 @@ BOOL_UNKNOWN = "unknown"
 
 class ACCAgent:
     """
-    ACCAgent: 前扣带皮层风格的自检模块（裁判 + 轻量编辑器）
+    ACCAgent: ACC-style self-check module (judge + lightweight editor)
 
-    主要接口:
+    Main interface:
         check_answer(question, gamma_results, initial_answer) -> dict
 
-    返回字典示例:
+    Example return dict:
     {
         "action": "KEEP",
         "final_answer": "yes",
@@ -46,8 +46,8 @@ class ACCAgent:
             "insufficient_evidence": False
         },
         "candidates": ["yes", "no", "unknown"],
-        "raw_llm_output": "<原始LLM输出文本>",
-        "raw_json": {...}  # 从LLM解析出的JSON
+        "raw_llm_output": "<raw llm output text>",
+        "raw_json": {...}  # JSON parsed from the LLM
     }
     """
 
@@ -57,11 +57,11 @@ class ACCAgent:
         self.llm = llm_client
 
     # ------------------------------------------------------------------
-    # 工具函数：格式化 Gamma 证据
+    # Helper: format Gamma evidence
     # ------------------------------------------------------------------
     def _format_gamma_evidence(self, gamma_results: List[Dict[str, Any]]) -> str:
         """
-        把 theta-gamma 的 step 结果整理成一段文本，提供给 ACC 使用。
+        Format theta-gamma step results into text for ACC.
         """
         lines: List[str] = []
         for i, step in enumerate(gamma_results, start=1):
@@ -86,7 +86,7 @@ class ACCAgent:
         return "\n".join(lines).strip()
 
     # ------------------------------------------------------------------
-    # 工具函数：判断是否是 yes/no 问题
+    # Helper: detect if it looks like a yes/no question
     # ------------------------------------------------------------------
     def _looks_like_yes_no_question(self, question: str) -> bool:
         q = question.strip().lower()
@@ -102,7 +102,7 @@ class ACCAgent:
         if any(q.startswith(s) for s in starters):
             return True
 
-        # 一些典型模式
+        # Some typical patterns
         patterns = [
             "same country", "same nationality", "same state",
             "is it true", "whether", "if it is"
@@ -113,27 +113,42 @@ class ACCAgent:
         return False
 
     # ------------------------------------------------------------------
-    # 工具函数：从问题中抽取“X or Y or Z”候选
+    # Helper: extract “A or B” options from the question
+    # NOTE: key fix to avoid treating the whole question as a candidate
     # ------------------------------------------------------------------
     def _extract_options_from_question(self, question: str) -> List[str]:
         """
-        从包含 "... A or B" 结构的问题中抽取候选实体。
-        这不是针对某一题的 hack，而是一个通用的 option parser。
+        Extract option entities from questions containing an "... A or B" structure.
+        This is a general option parser, not a per-question hack.
+
+        Important guardrails:
+        - Extract only when the last segment truly contains " A or B ".
+        - Questions without " or " (e.g., "What city is the person...") produce no candidates,
+          avoiding treating question fragments as answers.
         """
         q = question.strip().strip("?")
-        # 粗暴一点：只看最后一句里的 " or "
+        lower_q = q.lower()
+
+        # If no " or ", it is not a choice question
+        if " or " not in lower_q:
+            return []
+
+        # Only look at the last clause for " or "
         segment = q
         if "," in q:
-            # 截取最后一个逗号之后的部分，通常是 "... A or B"
+            # Take the part after the last comma, usually "... A or B"
             segment = q.split(",")[-1]
 
+        # If the last clause lacks " or " (comma elsewhere), skip extraction
+        if " or " not in segment.lower():
+            return []
+
         parts = [p.strip() for p in segment.split(" or ")]
-        # 过滤掉一些明显不是实体的东西
         options: List[str] = []
         for p in parts:
             if not p:
                 continue
-            # 去掉前导的连接词
+            # Drop leading connectives (only when options exist)
             for bad_prefix in ("which film", "which movie", "which", "who", "what"):
                 bp = bad_prefix + " "
                 if p.lower().startswith(bp):
@@ -141,7 +156,7 @@ class ACCAgent:
             if p:
                 options.append(p)
 
-        # 去重
+        # Deduplicate
         seen = set()
         uniq: List[str] = []
         for o in options:
@@ -152,7 +167,7 @@ class ACCAgent:
         return uniq
 
     # ------------------------------------------------------------------
-    # 工具函数：答案规范化
+    # Helper: normalize answers
     # ------------------------------------------------------------------
     def _norm(self, s: str) -> str:
         return s.strip().lower()
@@ -168,7 +183,37 @@ class ACCAgent:
         return ans.strip()
 
     # ------------------------------------------------------------------
-    # 主函数：自检 + 轻量编辑
+    # Helper: detect if a proposed answer looks like a question (final guardrail)
+    # ------------------------------------------------------------------
+    def _looks_like_questionish(self, text: str) -> bool:
+        """
+        Return True if an answer still looks like a question fragment.
+        Used as the last sanity check: ACC must not return such answers.
+        """
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+
+        # Contains a question mark
+        if "?" in t:
+            return True
+
+        # Starts with a wh- word
+        wh_prefixes = ("who ", "what ", "when ", "where ", "why ", "how ", "which ")
+        if any(t.startswith(p) for p in wh_prefixes):
+            return True
+
+        # Contains wh- words inside and is fairly long
+        tokens = t.split()
+        if len(tokens) > 10 and any(
+            f" {w} " in f" {t} " for w in ("who", "what", "when", "where", "why", "how", "which")
+        ):
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Main function: self-check + light edit
     # ------------------------------------------------------------------
     def check_answer(
         self,
@@ -177,14 +222,14 @@ class ACCAgent:
         initial_answer: str,
     ) -> Dict[str, Any]:
         """
-        ACC 自检主函数。
+        ACC main self-check function.
 
-        说明：
-        - ACC 不重新回答问题，只在有限动作中选择：
-            KEEP / FLIP_BOOL / CHOOSE_FROM_CANDIDATES / ANSWER_UNKNOWN
-        - 对于 yes/no 问题，候选集就是 {"yes","no","unknown"}。
-        - 对于带显式 options（A or B）的比较问题，候选集是 {A, B, ...} ∪ {initial_answer}。
-        - ACC 不允许输出候选集之外的实体。
+        Notes:
+        - ACC does not re-answer the question; it only chooses among:
+          KEEP / FLIP_BOOL / CHOOSE_FROM_CANDIDATES / ANSWER_UNKNOWN
+        - For yes/no questions, the candidates are {"yes", "no", "unknown"}.
+        - For explicit option questions (A or B), candidates = {A, B, ...} ∪ {initial_answer}.
+        - ACC must not output anything outside the candidate set.
         """
 
         if initial_answer is None:
@@ -193,14 +238,14 @@ class ACCAgent:
             initial_answer = str(initial_answer)
         initial_answer = initial_answer.strip()
 
-        # 1) 基本判断：是否 yes/no 题，是否有 options
+        # 1) Basic checks: is it yes/no, and does it have options
         is_bool_q = self._looks_like_yes_no_question(question)
         options = self._extract_options_from_question(question)
 
-        # 构造候选集
+        # Build candidate set
         candidates: List[str] = []
         if is_bool_q:
-            # 明确 yes/no/unknown 三种
+            # Explicit yes/no/unknown set
             candidates = [BOOL_YES, BOOL_NO, BOOL_UNKNOWN]
             init_norm = self._normalize_bool_answer(initial_answer)
             if init_norm in {BOOL_YES, BOOL_NO, BOOL_UNKNOWN}:
@@ -208,18 +253,17 @@ class ACCAgent:
             else:
                 initial_answer_normed = initial_answer
         else:
-            # 非 boolean：options + initial_answer
+            # Non-boolean: options + initial_answer
             candidates = options[:] if options else []
             if initial_answer and all(self._norm(initial_answer) != self._norm(o) for o in candidates):
                 candidates.append(initial_answer)
 
             initial_answer_normed = initial_answer
 
-        # 2) 格式化 Gamma 证据
+        # 2) Format Gamma evidence
         evidence_block = self._format_gamma_evidence(gamma_results)
 
-        # 3) 构造 ACC 的 prompt
-        #    强调：只能在给定 candidates 中选择 / 做有限 action
+        # 3) Build ACC prompt (must stay within given candidates/actions)
         candidate_list_str = ", ".join(f'"{c}"' for c in candidates) if candidates else ""
         bool_or_not = "YES_NO" if is_bool_q else "GENERAL"
 
@@ -314,7 +358,7 @@ Now respond with JSON ONLY:
                 temperature=0.0,
             )
         except Exception as e:
-            # 调用失败：保守选择 KEEP
+            # Call failed: conservatively KEEP
             return {
                 "action": ACTION_KEEP,
                 "final_answer": initial_answer_normed,
@@ -329,13 +373,13 @@ Now respond with JSON ONLY:
                 "raw_json": {},
             }
 
-        # 4) 解析 JSON
+        # 4) Parse JSON
         try:
             obj = extract_json_from_text(raw_llm_output)
             if not isinstance(obj, dict):
                 raise ValueError("ACC output is not a dict")
         except Exception as e:
-            # 解析失败：保守 KEEP
+            # Parse failed: conservatively KEEP
             return {
                 "action": ACTION_KEEP,
                 "final_answer": initial_answer_normed,
@@ -375,18 +419,14 @@ Now respond with JSON ONLY:
             "insufficient_evidence": bool(flags_raw.get("insufficient_evidence", False)),
         }
 
-        # 5) 根据 action 和 candidates 计算最终答案（加入强约束防呆）
+        # 5) Compute final answer based on action and candidates (strict guardrails)
         final_answer = initial_answer_normed
 
-        # boolean 题再规范化一次
+        # Normalize boolean answers again
         if is_bool_q:
             final_answer = self._normalize_bool_answer(initial_answer_normed)
-            # 同时也规范 candidates
+            # Normalize candidates as well
             candidates = [self._normalize_bool_answer(c) for c in candidates]
-
-        # safety: 如果 evidence 本身很混乱(比如 flags.logic_inconsistency=True)，
-        # 可以对 action 进行降级（这里先只打 flag，不强制降级，方便后续分析）。
-        # 若你希望更加保守，可以在这里强制 action=KEEP。
 
         if action == ACTION_KEEP:
             final_answer = initial_answer_normed
@@ -398,15 +438,15 @@ Now respond with JSON ONLY:
             elif norm_init == BOOL_NO:
                 final_answer = BOOL_YES
             else:
-                # 初始答案本身不是明确 yes/no，就不要乱翻
+                # Initial answer not clearly yes/no; do not flip
                 action = ACTION_KEEP
                 final_answer = initial_answer_normed
 
         elif action == ACTION_CHOOSE and candidates:
-            # 只能在 candidates 中选择
-            # 如果 LLM 没给 candidate_answer，或者不在候选集中，就退回 KEEP
+            # Must choose within candidates
+            # If missing or invalid candidate_answer, fall back to KEEP
             if candidate_answer:
-                # 对 boolean 题做规范化匹配
+                # Normalize boolean candidate before matching
                 if is_bool_q:
                     cand_norm = self._normalize_bool_answer(candidate_answer)
                     candidate_answer = cand_norm
@@ -414,7 +454,7 @@ Now respond with JSON ONLY:
                 if any(self._norm(candidate_answer) == self._norm(c) for c in candidates):
                     final_answer = candidate_answer
                 else:
-                    # 非法 candidate，回退 KEEP
+                    # Invalid candidate; fall back to KEEP
                     action = ACTION_KEEP
                     final_answer = initial_answer_normed
             else:
@@ -422,10 +462,25 @@ Now respond with JSON ONLY:
                 final_answer = initial_answer_normed
 
         elif action == ACTION_UNKNOWN:
-            # 使用统一的 unknown 标记
+            # Use a unified unknown label
             final_answer = BOOL_UNKNOWN if is_bool_q else "unknown"
 
-        # 6) 返回结果，供 pipeline / theta 写入 log
+        # 6) Final guardrail: ACC cannot return the question (or fragments) as an answer
+        if (not is_bool_q) and self._looks_like_questionish(final_answer):
+            # Directly fall back to Theta's original answer
+            if explanation:
+                explanation = (
+                    explanation
+                    + " NOTE: ACC candidate looked like a question, fallback to Theta initial answer."
+                )
+            else:
+                explanation = (
+                    "ACC candidate looked like a question, fallback to Theta initial answer."
+                )
+            action = ACTION_KEEP
+            final_answer = initial_answer_normed
+
+        # 7) Return result for pipeline/theta logging
         return {
             "action": action,
             "final_answer": final_answer,

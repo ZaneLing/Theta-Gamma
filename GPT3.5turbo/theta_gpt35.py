@@ -3,6 +3,7 @@
 
 from typing import Any, Dict, List, Optional
 import re
+from requests.exceptions import HTTPError, SSLError, ConnectionError, Timeout
 
 from gamma_gpt35 import LLMClient, GammaAgent, extract_json_from_text
 from acc_gpt35 import ACCAgent
@@ -464,11 +465,55 @@ Respond with JSON ONLY:
             ex_id = example.get("id", f"{self.dataset_name}_{example_index}")
 
         # 0) 先构建 Question Schema（让后续都在这个 frame 下运转）
-        schema = self._ensure_schema(question)
+        try:
+            schema = self._ensure_schema(question)
+        except Exception as e:
+            # 某些环境下 schema 调用可能被封禁或网络异常，直接跳过该样本，避免中断全局
+            status = None
+            resp_text = ""
+            if isinstance(e, HTTPError) and e.response is not None:
+                status = e.response.status_code
+                try:
+                    resp_text = e.response.text or ""
+                except Exception:
+                    resp_text = ""
+            if isinstance(e, (HTTPError, SSLError, ConnectionError, Timeout)) or status == 403 or "403" in str(e):
+                return {
+                    "example_index": example_index,
+                    "question": question,
+                    "skipped": True,
+                    "skip_stage": "schema",
+                    "skip_reason": f"Schema request failed: {e}",
+                    "skip_error_status": status,
+                    "skip_error_body": resp_text.strip(),
+                }
+            raise
         schema_summary = self._schema_summary(schema)  # 纯 log 用
 
         # 1) theta: plan subquestions
-        subquestions = self.plan_subquestions(question)
+        try:
+            subquestions = self.plan_subquestions(question)
+        except Exception as e:
+            status = None
+            resp_text = ""
+            if isinstance(e, HTTPError) and e.response is not None:
+                status = e.response.status_code
+                try:
+                    resp_text = e.response.text or ""
+                except Exception:
+                    resp_text = ""
+            # 如果分解调用出现 403 / 网络错误，直接跳过当前样本
+            if isinstance(e, (HTTPError, SSLError, ConnectionError, Timeout)) or status == 403 or "403" in str(e):
+                return {
+                    "example_index": example_index,
+                    "question": question,
+                    "skipped": True,
+                    "skip_stage": "plan_subquestions",
+                    "skip_reason": f"Planning failed: {e}",
+                    "skip_error_status": status,
+                    "skip_error_body": resp_text.strip(),
+                }
+            raise
         gamma_results: List[Dict[str, Any]] = []
         executed_subquestions: List[str] = []
 
