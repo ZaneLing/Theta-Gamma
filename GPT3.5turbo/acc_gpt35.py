@@ -62,16 +62,29 @@ class ACCAgent:
     def _format_gamma_evidence(self, gamma_results: List[Dict[str, Any]]) -> str:
         """
         Format theta-gamma step results into text for ACC.
+        这里会把 BridgeManager 的 bridge 信息也一并写进去，
+        方便 ACC 把 bridge_ok=False 的 step 当成“可疑证据”。
         """
         lines: List[str] = []
         for i, step in enumerate(gamma_results, start=1):
             subq = step.get("refined_subquestion") or step.get("subquestion")
             gres = step.get("gamma_result", {}) or {}
+            bridge = step.get("bridge", {}) or {}
             lines.append(f"Step {i}:")
             lines.append(f"  subquestion: {subq}")
             lines.append(f"  gamma_found: {gres.get('found')}")
             lines.append(f"  gamma_answer: {gres.get('answer')}")
             lines.append(f"  gamma_reasoning: {gres.get('reasoning')}")
+
+            # Bridge 信息：bridge_ok / anchors / matched_anchors
+            if bridge:
+                lines.append(
+                    f"  bridge_ok: {bridge.get('bridge_ok')} "
+                    f"anchors={bridge.get('anchors')} "
+                    f"matched_anchors={bridge.get('matched_anchors')}"
+                )
+                if bridge.get("bridge_reason"):
+                    lines.append(f"  bridge_note: {bridge.get('bridge_reason')}")
 
             fact_texts = gres.get("selected_fact_texts") or []
             if fact_texts:
@@ -260,7 +273,7 @@ class ACCAgent:
 
             initial_answer_normed = initial_answer
 
-        # 2) Format Gamma evidence
+        # 2) Format Gamma evidence (包含 bridge 信息)
         evidence_block = self._format_gamma_evidence(gamma_results)
 
         # 3) Build ACC prompt (must stay within given candidates/actions)
@@ -280,6 +293,13 @@ You receive:
 - INITIAL_ANSWER from Theta
 - STEPWISE EVIDENCE from Gamma
 - A CANDIDATE_ANSWER_SET that you MUST respect.
+- For each Gamma step, you may also see a line like:
+    "bridge_ok: <true/false> anchors=[...] matched_anchors=[...]"
+  These come from a BridgeManager that checks whether the selected facts actually
+  mention the anchor entities from the question/schema/previous steps.
+  - If bridge_ok=false, you should treat that step as UNRELIABLE EVIDENCE.
+  - Do NOT use such steps to aggressively flip or override the INITIAL_ANSWER.
+  - Prefer KEEP or ANSWER_UNKNOWN when evidence is weak or bridge_ok is mostly false.
 
 Your allowed actions (ACTION):
 1. "KEEP":
@@ -296,7 +316,7 @@ Your allowed actions (ACTION):
     - In that case, final_answer should be "unknown" (or equivalent).
 
 Guidelines:
-- Prefer ACTION="KEEP" unless you see a CLEAR and STRONG conflict between INITIAL_ANSWER and the evidence.
+- Prefer ACTION="KEEP" unless you see a CLEAR and STRONG conflict between INITIAL_ANSWER and the reliable evidence.
 - For YES/NO questions, normalised answers are:
     - "{BOOL_YES}" for yes/true,
     - "{BOOL_NO}" for no/false,
@@ -305,6 +325,8 @@ Guidelines:
     [{candidate_list_str}]
 
 You MUST answer ONLY the ORIGINAL QUESTION. Do NOT change its meaning.
+Do NOT output intermediate entities if the question asks for a film, person, country, etc.
+For example, if the question asks "Which film ...", the final answer must be a FILM TITLE, not a director name.
 
 You must output a SINGLE JSON object with fields:
 {{

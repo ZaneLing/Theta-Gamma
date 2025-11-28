@@ -242,7 +242,12 @@ def run_dataset(
             # Compute metrics outside Theta
             gold_answers = get_gold_answers(ex)
             pred_answer = result.get("predicted_answer", "")
-            ans_em_val = answer_em(theta_dataset, pred_answer, gold_answers)
+            theta_answer = result.get("theta_answer", "")
+            # EM is 1 if either Theta or ACC answer matches exactly per dataset rules
+            ans_em_theta = answer_em(theta_dataset, theta_answer, gold_answers)
+            ans_em_acc = answer_em(theta_dataset, pred_answer, gold_answers)
+            ans_em_val = 1.0 if max(ans_em_theta, ans_em_acc) >= 1.0 else 0.0
+            # F1 still computed on final predicted answer
             ans_f1_val = answer_f1(pred_answer, gold_answers)
 
             gold_support = get_gold_support_indices(theta_dataset, ex)

@@ -9,6 +9,173 @@ from gamma_gpt35 import LLMClient, GammaAgent, extract_json_from_text
 from acc_gpt35 import ACCAgent
 
 
+class BridgeManager:
+    """
+    BridgeManager: 轻量“桥接管理器”
+
+    目标：
+    - 利用 question schema 中的实体 + 之前 Gamma 找到的显式实体答案，
+      作为每一步子问题的 anchor（锚点实体）。
+    - 检查 Gamma 选中的 facts 是否真的提到了这些 anchor。
+    - 如果一个子问题明显依赖 anchor，但选中的 facts 里完全没出现，
+      则认为 bridge 不可靠：把该步标记为 bridge_ok=False，并把 found=False（gating）。
+
+    输出：
+    - 每步一个 meta:
+      {
+        "step_index": int,
+        "anchors": [...],
+        "matched_anchors": [...],
+        "bridge_ok": bool,
+        "bridge_reason": str
+      }
+    - trace 中的 "bridge_manager" 会包含 summary 方便 log/分析。
+    """
+
+    def __init__(self, question: str, schema: Dict[str, Any]):
+        self.question = question
+        self.schema = schema or {}
+        # 从 schema 中抽取显式实体名字
+        self.schema_entities: List[str] = []
+        for e in self.schema.get("entities", []) or []:
+            name = (e.get("name") or "").strip()
+            if name:
+                self.schema_entities.append(name)
+        # 之前各步 Gamma 的 answer（实体类答案）
+        self.prev_answers: List[str] = []
+        # 每步的 bridge 记录
+        self.steps: List[Dict[str, Any]] = []
+
+    def _extract_anchors_for_subquestion(self, subq: str) -> List[str]:
+        """
+        对当前 refined_subquestion 抽取“应当对齐的锚点实体”：
+        - schema 中在该子问题里出现的 entity name；
+        - 之前各步显式 answer 在该子问题中出现的。
+        """
+        anchors = set()
+        sq_lower = (subq or "").lower()
+
+        # schema 实体
+        for name in self.schema_entities:
+            n = name.strip()
+            if n and n.lower() in sq_lower:
+                anchors.add(n)
+
+        # 之前 answer 作为潜在中间实体
+        for ans in self.prev_answers:
+            a = ans.strip()
+            if a and a.lower() in sq_lower:
+                anchors.add(a)
+
+        return list(anchors)
+
+    def update_step(
+        self,
+        step_index: int,
+        refined_subq: str,
+        gamma_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        在 Gamma 每一步之后调用：
+        - 根据 refined_subq 抽 anchor；
+        - 看 selected_fact_texts 里有没有提到这些 anchor；
+        - 如有 anchor 但完全没命中，则：
+            - bridge_ok=False
+            - 在 gamma_result["reasoning"] 里标记
+            - 并把 gamma_result["found"] 强制改为 False（gating）
+        - 如果本步仍然 found 且 answer 是字符串，则把 answer 记入 prev_answers。
+        """
+        anchors = self._extract_anchors_for_subquestion(refined_subq)
+        selected_texts = gamma_result.get("selected_fact_texts") or []
+        big_text = " ".join(str(t) for t in selected_texts).lower()
+        matched_anchors: List[str] = []
+        if big_text:
+            matched_anchors = [a for a in anchors if a.lower() in big_text]
+
+        bridge_ok = True
+        bridge_reason = ""
+
+        if anchors:
+            if gamma_result.get("found"):
+                if not matched_anchors:
+                    # 有明确锚点，但选的 facts 里完全没出现：认为桥接不可靠，直接 gate 掉
+                    bridge_ok = False
+                    bridge_reason = (
+                        "Gamma selected facts do not mention any anchor entities from "
+                        "schema/previous answers."
+                    )
+                    gamma_result["found"] = False
+                    gamma_result.setdefault("reasoning", "")
+                    if "BridgeManager" not in gamma_result["reasoning"]:
+                        gamma_result["reasoning"] += (
+                            " [BridgeManager: anchor entities not found in selected facts; "
+                            "treat as not found]"
+                        )
+            else:
+                # 本来就没找到答案，但这个子问题带锚点 -> 说明桥接链在此断裂
+                bridge_ok = False
+                bridge_reason = (
+                    "Gamma could not find an answer for a subquestion that depends on "
+                    "anchor entities."
+                )
+        else:
+            # 没有检测到锚点：默认通过，不做 gating
+            bridge_ok = True
+            bridge_reason = ""
+
+        # 记录“仍然当做 found 的实体答案”，供后续步使用
+        ans = gamma_result.get("answer")
+        if gamma_result.get("found") and isinstance(ans, str) and ans.strip():
+            self.prev_answers.append(ans.strip())
+            # 简单截断，避免列表过长
+            if len(self.prev_answers) > 6:
+                self.prev_answers = self.prev_answers[-6:]
+
+        meta = {
+            "step_index": step_index,
+            "anchors": anchors,
+            "matched_anchors": matched_anchors,
+            "bridge_ok": bridge_ok,
+            "bridge_reason": bridge_reason,
+        }
+        self.steps.append(meta)
+        return meta
+
+    def summary(self) -> str:
+        """
+        返回一个简短 summary，给 log/后续 prompt 使用。
+        """
+        if not self.steps:
+            return "BridgeManager: no steps recorded."
+        lines: List[str] = []
+        bad = 0
+        for s in self.steps:
+            ok = bool(s.get("bridge_ok", True))
+            if not ok:
+                bad += 1
+            lines.append(
+                f"step {s.get('step_index')}: bridge_ok={ok}, "
+                f"anchors={s.get('anchors')}, matched={s.get('matched_anchors')}, "
+                f"reason={s.get('bridge_reason')}"
+            )
+        if bad == 0:
+            head = "BridgeManager summary: all steps passed anchor-entity bridge checks."
+        else:
+            head = (
+                f"BridgeManager summary: {bad}/{len(self.steps)} steps had weak or "
+                f"missing anchor-entity alignment."
+            )
+        return head + "\n" + "\n".join(lines)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "question": self.question,
+            "schema_entities": list(self.schema_entities),
+            "steps": list(self.steps),
+            "summary": self.summary(),
+        }
+
+
 class ThetaAgent:
     """
     Theta agent:
@@ -27,6 +194,9 @@ class ThetaAgent:
         self.acc = ACCAgent(dataset_name=dataset_name, llm_client=llm_client)
         self.llm = llm_client
         self.gamma = GammaAgent(dataset_name=dataset_name, llm_client=llm_client)
+
+        # BridgeManager 类（方便之后如果想换实现）
+        self.bridge_manager_cls = BridgeManager
 
         # 当前样本的问题 schema 缓存（避免重复推一次）
         self._schema_question: Optional[str] = None
@@ -445,9 +615,16 @@ Respond with JSON ONLY:
             reasoning = str(reasoning)
         reasoning = reasoning.strip()
 
+        # Include the original question inside the reasoning for clearer logs.
+        combined_reasoning = (
+            f"Question: {question}\n"
+            f"Reasoning: {reasoning}\n"
+            f"Final answer: {answer}"
+        )
+
         return {
             "answer": answer,
-            "reasoning": reasoning,
+            "reasoning": combined_reasoning,
             "raw_json": obj,
         }
 
@@ -489,6 +666,9 @@ Respond with JSON ONLY:
                 }
             raise
         schema_summary = self._schema_summary(schema)  # 纯 log 用
+
+        # 初始化 BridgeManager
+        bridge_manager = self.bridge_manager_cls(question=question, schema=schema)
 
         # 1) theta: plan subquestions
         try:
@@ -537,6 +717,13 @@ Respond with JSON ONLY:
                 subquestion=refined_subq,
                 call_id=call_id,
             )
+            # BridgeManager: 检测这一步的锚点对齐情况，并做 gating
+            bridge_meta = bridge_manager.update_step(
+                step_index=step_idx,
+                refined_subq=refined_subq,
+                gamma_result=gr,
+            )
+
             if gr.get("found"):
                 gamma_success_count += 1
             gamma_results.append(
@@ -545,6 +732,7 @@ Respond with JSON ONLY:
                     "subquestion": subq,
                     "refined_subquestion": refined_subq,
                     "gamma_result": gr,
+                    "bridge": bridge_meta,
                 }
             )
 
@@ -580,6 +768,7 @@ Respond with JSON ONLY:
             "gamma_call_count": gamma_call_count,
             "gamma_success_count": gamma_success_count,
             "symbolic_comparator": comparator,
+            "bridge_manager": bridge_manager.to_dict(),
         }
 
         llm_calls = getattr(self.llm, "call_log", [])
