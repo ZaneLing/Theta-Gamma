@@ -5,7 +5,9 @@ import os
 import json
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+import requests
 from tqdm import tqdm
 
 from gamma_gpt35 import LLMClient
@@ -57,6 +59,58 @@ def ensure_gpt35_default() -> None:
     Also reminds users to set OPENROUTER_API_KEY or OPENAI_API_KEY.
     """
     os.environ["MODEL_NAME"] = "openai/gpt-3.5-turbo"
+
+
+class OllamaLLMClient:
+    """
+    Minimal Ollama /api/generate client (used when theta runs on an Ollama host).
+    """
+
+    def __init__(
+        self,
+        call_log: Optional[List[Dict[str, Any]]] = None,
+        model_name: str = "deepseek-r1:14b",
+        api_url: Optional[str] = None,
+    ):
+        self.api_url = api_url or os.getenv("THETA_OLLAMA_URL", "http://172.16.120.14:11434/api/generate")
+        self.model_name = model_name or "deepseek-r1:14b"
+        self.call_log: List[Dict[str, Any]] = call_log if call_log is not None else []
+
+    def generate(
+        self,
+        prompt: str,
+        meta: Optional[Dict[str, Any]] = None,
+        temperature: float = 0.2,
+    ) -> str:
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        MAX_RETRY = 5
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                resp = requests.post(
+                    self.api_url,
+                    json=payload,
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                text = data.get("response", "")
+                self.call_log.append({
+                    "type": "llm_call",
+                    "meta": meta or {},
+                    "request": payload,
+                    "raw_response": data,
+                    "response_text": text,
+                })
+                return text
+            except Exception as e:
+                if attempt == MAX_RETRY:
+                    raise e
+                print(f"[OllamaLLMClient] Timeout or error, retrying ({attempt}/{MAX_RETRY})...")
 
 
 def load_dataset(path: str) -> List[Dict[str, Any]]:
@@ -145,6 +199,9 @@ def run_dataset(
     log_dir: str,
     theta_dataset: str,
     limit: int = -1,
+    theta_model_name: Optional[str] = "gpt-o3",
+    theta_provider: str = "openrouter",
+    theta_ollama_url: Optional[str] = None,
 ) -> None:
     ensure_gpt35_default()
     os.makedirs(log_dir, exist_ok=True)
@@ -201,8 +258,34 @@ def run_dataset(
         vlog = open(verbose_log_path, "a", encoding="utf-8")
         for idx, ex in pbar:
             call_log: List[Dict[str, Any]] = []
-            llm_client = LLMClient(call_log=call_log)
-            theta = ThetaAgent(dataset_name=theta_dataset, llm_client=llm_client)
+            # Gamma + ACC stay on baseline GPT-3.5; theta can optionally use a different model.
+            gamma_llm = LLMClient(call_log=call_log)
+            desired_theta_model = theta_model_name or os.getenv("THETA_MODEL_NAME")
+            if theta_provider == "ollama":
+                theta_llm = OllamaLLMClient(
+                    call_log=call_log,
+                    model_name=desired_theta_model or "deepseek-r1:14b",
+                    api_url=theta_ollama_url or os.getenv("THETA_OLLAMA_URL"),
+                )
+            else:
+                if desired_theta_model and desired_theta_model != gamma_llm.model_name:
+                    # If the theta model is unavailable, auto-fallback to gamma's model.
+                    theta_llm = LLMClient(
+                        call_log=call_log,
+                        model_name=desired_theta_model,
+                        fallback_model_name=gamma_llm.model_name,
+                    )
+                else:
+                    theta_llm = gamma_llm
+            theta_model_id = getattr(theta_llm, "model_name", "unknown")
+            gamma_model_id = getattr(gamma_llm, "model_name", "unknown")
+            theta_model_short = theta_model_id.split("/")[-1]
+            gamma_model_short = gamma_model_id.split("/")[-1]
+            theta = ThetaAgent(
+                dataset_name=theta_dataset,
+                llm_client=gamma_llm,
+                theta_llm_client=theta_llm,
+            )
 
             result = theta.solve_one(ex, example_index=idx)
 
@@ -221,6 +304,7 @@ def run_dataset(
                     f"==== Example {idx} ====",
                     f"[SKIPPED {skip_stage}] {result.get('skip_reason')}",
                     f"Question: {question_txt}",
+                    f"LLMs: theta={theta_model_id} ({theta_model_short}), gamma/acc={gamma_model_id} ({gamma_model_short})",
                 ]
                 if resp_body:
                     vlog_lines.append(f"Response body: {resp_body}")
@@ -294,15 +378,18 @@ def run_dataset(
             log_lines: List[str] = []
             log_lines.append(f"==== Example {idx} ====")
             log_lines.append(f"Question: {result.get('question')}")
+            log_lines.append(
+                f"[LLMs] theta={theta_model_id} ({theta_model_short}), gamma/acc={gamma_model_id} ({gamma_model_short})"
+            )
             for step in gamma_steps:
                 planned = step.get("subquestion", "")
                 refined = step.get("refined_subquestion") or planned
                 gres = step.get("gamma_result", {}) or {}
                 log_lines.append(
-                    f"[Theta -> Gamma] step {step.get('step_index')}: {refined} (planned: {planned})"
+                    f"[Theta -> Gamma | llm={gamma_model_short}] step {step.get('step_index')}: {refined} (planned: {planned})"
                 )
                 log_lines.append(
-                    f"[Gamma -> Theta] found={gres.get('found')} answer={gres.get('answer')} "
+                    f"[Gamma -> Theta | llm={gamma_model_short}] found={gres.get('found')} answer={gres.get('answer')} "
                     f"reason={gres.get('reasoning')} used_facts={gres.get('selected_fact_indices')}"
                 )
             # Question schema / comparator hints (if present)
@@ -314,11 +401,11 @@ def run_dataset(
                 )
             # Theta's own integrated answer (before ACC)
             log_lines.append(
-                f"[Theta answer] {result.get('theta_answer')}"
+                f"[Theta answer | llm={theta_model_short}] {result.get('theta_answer')}"
             )
             # ACC self-check
             log_lines.append(
-                f"[ACC] action={acc_action} final_answer={acc_final} "
+                f"[ACC | llm={gamma_model_short}] action={acc_action} final_answer={acc_final} "
                 f"flags={acc.get('flags')} "
                 f"revised={'yes' if acc_changed else 'no-op'}"
             )
@@ -394,6 +481,26 @@ def main():
         default="logs",
         help="Directory to store JSONL logs",
     )
+    parser.add_argument(
+        "--theta-model",
+        type=str,
+        default="gpt-o3",
+        help="Model identifier for theta (OpenRouter style). "
+             "Gamma/ACC stay on GPT-3.5-turbo. Example: gpt-o3 (alias for openai/o3-mini)",
+    )
+    parser.add_argument(
+        "--theta-provider",
+        type=str,
+        choices=["openrouter", "ollama"],
+        default="openrouter",
+        help="Theta LLM backend: openrouter (default) or ollama (for local/remote hosts).",
+    )
+    parser.add_argument(
+        "--theta-ollama-url",
+        type=str,
+        default=os.getenv("THETA_OLLAMA_URL"),
+        help="Ollama /api/generate endpoint for theta (e.g., http://172.16.120.14:11434/api/generate).",
+    )
 
     args = parser.parse_args()
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
@@ -420,7 +527,20 @@ def main():
         data = load_dataset(data_path)
 
         limit = args.limit if args.limit and args.limit > 0 else -1
-        run_dataset(dataset_name, data, log_dir=args.log_dir, theta_dataset=theta_dataset, limit=limit)
+        if args.theta_provider == "ollama":
+            theta_model_name = args.theta_model or os.getenv("THETA_MODEL_NAME") or "deepseek-r1:14b"
+        else:
+            theta_model_name = args.theta_model or os.getenv("THETA_MODEL_NAME") or "gpt-o3"
+        run_dataset(
+            dataset_name,
+            data,
+            log_dir=args.log_dir,
+            theta_dataset=theta_dataset,
+            limit=limit,
+            theta_model_name=theta_model_name,
+            theta_provider=args.theta_provider,
+            theta_ollama_url=args.theta_ollama_url,
+        )
 
 
 if __name__ == "__main__":

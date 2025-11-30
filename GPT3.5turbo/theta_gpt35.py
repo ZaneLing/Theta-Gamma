@@ -1,73 +1,160 @@
 # theta_gpt35.py
-# Theta agent: orchestrates Gamma calls, applies ACC self-check, question schema, and returns trace.
+# Theta agent: orchestrates Gamma calls, applies ACC self-check,
+# question schema + slot graph, BridgeManager, and returns trace.
 
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 import re
 from requests.exceptions import HTTPError, SSLError, ConnectionError, Timeout
+import yaml
 
 from gamma_gpt35 import LLMClient, GammaAgent, extract_json_from_text
 from acc_gpt35 import ACCAgent
 
 
+_PROMPT_CACHE: Dict[str, str] = {}
+
+
+def _load_prompts() -> Dict[str, str]:
+    global _PROMPT_CACHE
+    if _PROMPT_CACHE:
+        return _PROMPT_CACHE
+    prompt_path = Path(__file__).resolve().parent / "prompts" / "theta_prompts.yaml"
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    _PROMPT_CACHE = {str(k): str(v) for k, v in data.items()}
+    return _PROMPT_CACHE
+
+
+def get_prompt(name: str) -> str:
+    prompts = _load_prompts()
+    if name not in prompts:
+        raise KeyError(f"Prompt '{name}' not found")
+    return prompts[name]
+
+
 class BridgeManager:
     """
-    BridgeManager: 轻量“桥接管理器”
+    BridgeManager: lightweight “bridge” manager.
 
-    目标：
-    - 利用 question schema 中的实体 + 之前 Gamma 找到的显式实体答案，
-      作为每一步子问题的 anchor（锚点实体）。
-    - 检查 Gamma 选中的 facts 是否真的提到了这些 anchor。
-    - 如果一个子问题明显依赖 anchor，但选中的 facts 里完全没出现，
-      则认为 bridge 不可靠：把该步标记为 bridge_ok=False，并把 found=False（gating）。
+    Goals:
+    - Use schema entities plus previous Gamma entity answers as anchors for each subquestion.
+    - Check whether Gamma-selected facts actually mention these anchors.
+    - If a subquestion clearly depends on anchors but selected facts omit them, mark the bridge
+      as unreliable: set bridge_ok=False and found=False (gating).
 
-    输出：
-    - 每步一个 meta:
+    This version adds:
+    - Support for entity aliases (schema.entities[*].aliases) as anchor forms.
+    - Simple pronoun alignment: if subquestions contain he/she/they/this film/that movie, use
+      the most recent Gamma answer as an anchor.
+    - Track hits by “wiki page group”; when the same anchor appears on a new page group, note it
+      to reduce cross-article drift (logging hint, not enforced gating).
+
+    Output per step:
       {
         "step_index": int,
-        "anchors": [...],
-        "matched_anchors": [...],
+        "anchors": [...],          # anchors inferred for the current subquestion
+        "matched_anchors": [...],  # anchors actually matched in selected_fact_texts
         "bridge_ok": bool,
-        "bridge_reason": str
+        "bridge_reason": str,
+        "page_titles": [...],      # rough page titles hit in this step
       }
-    - trace 中的 "bridge_manager" 会包含 summary 方便 log/分析。
+    The trace’s "bridge_manager" contains summary + anchor_pages for logging/analysis.
     """
 
     def __init__(self, question: str, schema: Dict[str, Any]):
         self.question = question
         self.schema = schema or {}
-        # 从 schema 中抽取显式实体名字
+
+        # Pull explicit entity names + aliases from the schema
+        # schema_entities: canonical names
+        # entity_alias_map: canonical name -> [alias1, alias2, ...]
+        # all_anchor_forms: every surface form usable as an anchor (name + alias)
         self.schema_entities: List[str] = []
+        self.entity_alias_map: Dict[str, List[str]] = {}
+        self.all_anchor_forms: List[str] = []
+
         for e in self.schema.get("entities", []) or []:
             name = (e.get("name") or "").strip()
+            aliases = e.get("aliases") or e.get("alias") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            aliases = [a.strip() for a in aliases if isinstance(a, str) and a.strip()]
+
             if name:
                 self.schema_entities.append(name)
-        # 之前各步 Gamma 的 answer（实体类答案）
+                self.all_anchor_forms.append(name)
+                if aliases:
+                    self.entity_alias_map[name] = aliases
+                    self.all_anchor_forms.extend(aliases)
+
+        # Entity-style answers from previous Gamma steps
         self.prev_answers: List[str] = []
-        # 每步的 bridge 记录
+
+        # Record which rough page titles each anchor hit
+        # anchor_pages[anchor] = ["Title1", "Title2", ...]
+        self.anchor_pages: Dict[str, List[str]] = {}
+
+        # Per-step bridge records
         self.steps: List[Dict[str, Any]] = []
 
     def _extract_anchors_for_subquestion(self, subq: str) -> List[str]:
         """
-        对当前 refined_subquestion 抽取“应当对齐的锚点实体”：
-        - schema 中在该子问题里出现的 entity name；
-        - 之前各步显式 answer 在该子问题中出现的。
+        Extract anchor entities for the current refined_subquestion:
+        - Schema entity names or aliases that appear in the subquestion.
+        - Explicit answers from prior steps that appear in the subquestion.
+        - Simple pronoun alignment: if he/she/they/this film/etc. appear and there are
+          previous answers, use the most recent answer as an anchor.
         """
         anchors = set()
-        sq_lower = (subq or "").lower()
+        sq = (subq or "")
+        sq_lower = sq.lower()
 
-        # schema 实体
-        for name in self.schema_entities:
-            n = name.strip()
-            if n and n.lower() in sq_lower:
-                anchors.add(n)
+        # Schema entities (name + alias)
+        for form in self.all_anchor_forms:
+            f = form.strip()
+            if f and f.lower() in sq_lower:
+                anchors.add(f)
 
-        # 之前 answer 作为潜在中间实体
+        # Prior answers as potential intermediate entities
         for ans in self.prev_answers:
             a = ans.strip()
             if a and a.lower() in sq_lower:
                 anchors.add(a)
 
+        # Pronoun alignment: with pronouns + history, use the most recent answer as anchor
+        pronoun_markers = [
+            " he ", " she ", " they ", " him ", " her ", " them ",
+            " this person", " that person", " the person",
+            " this man", " that man", " this woman", " that woman",
+            " this film", " that film", " this movie", " that movie",
+            " the film", " the movie",
+        ]
+        padded = f" {sq_lower} "
+        if any(p in padded for p in pronoun_markers) and self.prev_answers:
+            last_ans = self.prev_answers[-1].strip()
+            if last_ans:
+                anchors.add(last_ans)
+
         return list(anchors)
+
+    def _extract_page_titles(self, selected_texts: List[Any]) -> List[str]:
+        """
+        Roughly extract “page titles” from selected_fact_texts:
+        prefer the part before a colon; otherwise take a short prefix.
+        """
+        titles = set()
+        for t in selected_texts or []:
+            s = str(t)
+            if ":" in s:
+                head = s.split(":", 1)[0].strip()
+                if head:
+                    titles.add(head)
+            else:
+                snippet = s[:80].strip()
+                if snippet:
+                    titles.add(snippet)
+        return sorted(titles)
 
     def update_step(
         self,
@@ -76,33 +163,36 @@ class BridgeManager:
         gamma_result: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        在 Gamma 每一步之后调用：
-        - 根据 refined_subq 抽 anchor；
-        - 看 selected_fact_texts 里有没有提到这些 anchor；
-        - 如有 anchor 但完全没命中，则：
+        Call after each Gamma step:
+        - Extract anchors from refined_subq.
+        - Check whether selected_fact_texts mention these anchors.
+        - If anchors exist but none are mentioned:
             - bridge_ok=False
-            - 在 gamma_result["reasoning"] 里标记
-            - 并把 gamma_result["found"] 强制改为 False（gating）
-        - 如果本步仍然 found 且 answer 是字符串，则把 answer 记入 prev_answers。
+            - annotate gamma_result["reasoning"]
+            - force gamma_result["found"]=False (gating)
+        - If still found and answer is a string, record it in prev_answers.
+        - Record page_titles and accumulate in anchor_pages.
         """
         anchors = self._extract_anchors_for_subquestion(refined_subq)
         selected_texts = gamma_result.get("selected_fact_texts") or []
         big_text = " ".join(str(t) for t in selected_texts).lower()
+        page_titles = self._extract_page_titles(selected_texts)
+
         matched_anchors: List[str] = []
         if big_text:
             matched_anchors = [a for a in anchors if a.lower() in big_text]
 
         bridge_ok = True
-        bridge_reason = ""
+        bridge_reason_parts: List[str] = []
 
+        # Main gating: anchors exist but facts never mention them
         if anchors:
             if gamma_result.get("found"):
                 if not matched_anchors:
-                    # 有明确锚点，但选的 facts 里完全没出现：认为桥接不可靠，直接 gate 掉
                     bridge_ok = False
-                    bridge_reason = (
-                        "Gamma selected facts do not mention any anchor entities from "
-                        "schema/previous answers."
+                    bridge_reason_parts.append(
+                        "Gamma selected facts do not mention any anchor entities "
+                        "from schema/previous answers."
                     )
                     gamma_result["found"] = False
                     gamma_result.setdefault("reasoning", "")
@@ -112,22 +202,37 @@ class BridgeManager:
                             "treat as not found]"
                         )
             else:
-                # 本来就没找到答案，但这个子问题带锚点 -> 说明桥接链在此断裂
+                # Already not found, and the subquestion needs anchors -> bridge breaks here
                 bridge_ok = False
-                bridge_reason = (
+                bridge_reason_parts.append(
                     "Gamma could not find an answer for a subquestion that depends on "
                     "anchor entities."
                 )
         else:
-            # 没有检测到锚点：默认通过，不做 gating
+            # No anchors detected: pass, no gating
             bridge_ok = True
-            bridge_reason = ""
 
-        # 记录“仍然当做 found 的实体答案”，供后续步使用
+        # Track page groups, note cross-page jumps
+        if matched_anchors and page_titles:
+            for a in matched_anchors:
+                prev_pages = set(self.anchor_pages.get(a, []))
+                new_pages = set(page_titles)
+                if prev_pages and not (prev_pages & new_pages):
+                    # Same anchor appears in a new page group: add a cross-page note
+                    bridge_reason_parts.append(
+                        f"Anchor '{a}' moved from pages {sorted(prev_pages)} "
+                        f"to new pages {sorted(new_pages)}."
+                    )
+                merged = sorted(prev_pages | new_pages) if prev_pages else sorted(new_pages)
+                self.anchor_pages[a] = merged
+
+        bridge_reason = " ".join(bridge_reason_parts).strip()
+
+        # Keep entity answers that are still considered found, for later steps
         ans = gamma_result.get("answer")
         if gamma_result.get("found") and isinstance(ans, str) and ans.strip():
             self.prev_answers.append(ans.strip())
-            # 简单截断，避免列表过长
+            # Trim list to avoid overgrowth
             if len(self.prev_answers) > 6:
                 self.prev_answers = self.prev_answers[-6:]
 
@@ -137,13 +242,14 @@ class BridgeManager:
             "matched_anchors": matched_anchors,
             "bridge_ok": bridge_ok,
             "bridge_reason": bridge_reason,
+            "page_titles": page_titles,
         }
         self.steps.append(meta)
         return meta
 
     def summary(self) -> str:
         """
-        返回一个简短 summary，给 log/后续 prompt 使用。
+        Return a short summary for logs/prompts.
         """
         if not self.steps:
             return "BridgeManager: no steps recorded."
@@ -156,6 +262,7 @@ class BridgeManager:
             lines.append(
                 f"step {s.get('step_index')}: bridge_ok={ok}, "
                 f"anchors={s.get('anchors')}, matched={s.get('matched_anchors')}, "
+                f"pages={s.get('page_titles')}, "
                 f"reason={s.get('bridge_reason')}"
             )
         if bad == 0:
@@ -171,38 +278,42 @@ class BridgeManager:
         return {
             "question": self.question,
             "schema_entities": list(self.schema_entities),
+            "entity_alias_map": dict(self.entity_alias_map),
+            "anchor_pages": dict(self.anchor_pages),
             "steps": list(self.steps),
             "summary": self.summary(),
         }
 
-
 class ThetaAgent:
     """
     Theta agent:
-    - Question schema analysis (task type, answer role, entities)
+    - Question schema analysis (task type, answer role, entities, slots, subgoals)
     - Plan subquestions (theta)
     - Dispatch gamma as needed
     - Dynamically rewrite later subquestions using previous answers
-    - Integrate the final answer (with symbolic comparator hints)
+    - Integrate the final answer (with symbolic & multi-constraint hints)
     - Call ACC for lightweight self-check
     - Return full trace (for logging / analysis)
     """
 
-    def __init__(self, dataset_name: str, llm_client: LLMClient):
+    def __init__(self, dataset_name: str, llm_client: LLMClient, theta_llm_client: Optional[LLMClient] = None):
         assert dataset_name in {"2wiki", "hotpotqa", "musique"}
         self.dataset_name = dataset_name
-        self.acc = ACCAgent(dataset_name=dataset_name, llm_client=llm_client)
-        self.llm = llm_client
-        self.gamma = GammaAgent(dataset_name=dataset_name, llm_client=llm_client)
+        # Gamma/ACC use the baseline client (e.g., gpt-3.5), while theta can use a separate model.
+        self.gamma_llm = llm_client
+        self.theta_llm = theta_llm_client or llm_client
+        self.acc = ACCAgent(dataset_name=dataset_name, llm_client=self.gamma_llm)
+        self.llm = self.theta_llm
+        self.gamma = GammaAgent(dataset_name=dataset_name, llm_client=self.gamma_llm)
 
-        # BridgeManager 类（方便之后如果想换实现）
+        # BridgeManager class (swap implementation easily if needed)
         self.bridge_manager_cls = BridgeManager
 
-        # 当前样本的问题 schema 缓存（避免重复推一次）
+        # Cache for the current sample's question schema (avoid repeat calls)
         self._schema_question: Optional[str] = None
         self._schema: Optional[Dict[str, Any]] = None
 
-    # ---------- Question Schema 构建 ----------
+    # ---------- Question Schema Construction ----------
 
     def _ensure_schema(self, question: str) -> Dict[str, Any]:
         """
@@ -217,58 +328,20 @@ class ThetaAgent:
 
     def build_question_schema(self, question: str) -> Dict[str, Any]:
         """
-        构造一个轻量 Question Schema：
+        Build a Question Schema + Slot Graph:
         - question_type: yes_no / comparison / fact / count / other
         - answer_form: yes_no / entity_name / number / date / span / other
-        - focus: 人 / 电影 / 地点 / 机构 / other（仅提示用）
-        - entities: [{"name": ..., "type": ..., "role": ...}, ...]
-        - constraints / notes: 任务规则 & 其他说明
+        - focus: person / film / location / organization / other (hint only)
+        - entities: [{"name": ..., "type": ..., "role": ..., "aliases": [...]}, ...]
+        - constraints / notes: task rules & other hints
+        - slots: intermediate slots (id / description / required / expected_type)
+        - subgoals: subgoals (id / description / fills_slots)
+        - final_composition: how to combine slot values into the final answer
         """
-        prompt = f"""
-You are a QUESTION SCHEMA ANALYZER for a multi-hop QA system (THETA-GAMMA).
-
-Given the ORIGINAL QUESTION, you must produce a compact schema that describes:
-- The task type (yes/no, comparison, fact lookup, count, etc.).
-- The expected answer form (yes/no, entity name, number, date, etc.).
-- The main entities involved and their roles.
-- Any key constraints or multi-hop structure.
-
-CRITICAL:
-Return a SINGLE JSON object with keys:
-  - "question_type": one of ["yes_no", "comparison", "fact", "count", "other"]
-  - "answer_form": one of ["yes_no", "entity_name", "number", "date", "span", "other"]
-  - "focus": short phrase for what the answer is about (e.g., "film", "person", "city", "organization", "generic").
-  - "entities": array of objects, each:
-        {{
-          "name": string,              # surface form in the question if any
-          "type": string,              # e.g., "person", "film", "city", "organization", "other"
-          "role": string               # e.g., "subject", "candidate1", "candidate2", "pivot", "target"
-        }}
-  - "constraints": array of short strings describing important logical conditions.
-  - "notes": short English description of how the question should be solved and what the final answer must look like.
-
-Example output:
-{{
-  "question_type": "comparison",
-  "answer_form": "entity_name",
-  "focus": "film",
-  "entities": [
-    {{"name": "Charge It To Me", "type": "film", "role": "candidate1"}},
-    {{"name": "Danger: Diabolik", "type": "film", "role": "candidate2"}},
-    {{"name": "", "type": "person", "role": "director"}}
-  ],
-  "constraints": [
-    "compare which director is younger",
-    "answer must be the film whose director is younger"
-  ],
-  "notes": "Two-hop: find each film's director, then compare their ages and answer with the film title."
-}}
-
-ORIGINAL QUESTION:
-{question}
-
-Respond with JSON ONLY:
-""".strip()
+        prompt = get_prompt("question_schema").format(
+            dataset_name=self.dataset_name,
+            question=question,
+        ).strip()
 
         raw_text = self.llm.generate(
             prompt,
@@ -280,7 +353,7 @@ Respond with JSON ONLY:
             temperature=0.2,
         )
 
-        # 容错解析
+        # Robust parsing
         try:
             obj = extract_json_from_text(raw_text)
             if not isinstance(obj, dict):
@@ -288,7 +361,48 @@ Respond with JSON ONLY:
         except Exception:
             obj = {}
 
-        # 填默认值，避免下游 KeyError
+        # Extract slots / subgoals / final_composition with correct types
+        slots = obj.get("slots") or []
+        if not isinstance(slots, list):
+            slots = []
+        subgoals = obj.get("subgoals") or []
+        if not isinstance(subgoals, list):
+            subgoals = []
+        final_comp = obj.get("final_composition") or obj.get("final_answer_composition") or ""
+        if not isinstance(final_comp, str):
+            final_comp = str(final_comp)
+
+        # Enforce: every required slot has at least one subgoal bound
+        slot_ids_required = {str(s.get("id")).strip()
+                             for s in slots
+                             if isinstance(s, dict) and s.get("required") and str(s.get("id")).strip()}
+        filled_ids = set()
+        for g in subgoals:
+            if not isinstance(g, dict):
+                continue
+            for sid in g.get("fills_slots") or []:
+                sid_str = str(sid).strip()
+                if sid_str:
+                    filled_ids.add(sid_str)
+        missing_ids = sorted(slot_ids_required - filled_ids)
+        if missing_ids:
+            for mid in missing_ids:
+                # Find the slot description
+                desc = ""
+                for s in slots:
+                    if isinstance(s, dict) and str(s.get("id")).strip() == mid:
+                        desc = (s.get("description") or "").strip()
+                        break
+                auto_id = f"auto_{mid}"
+                subgoals.append(
+                    {
+                        "id": auto_id,
+                        "description": desc or f"Resolve slot {mid}",
+                        "fills_slots": [mid],
+                    }
+                )
+
+        # Fill defaults to avoid downstream KeyErrors
         schema: Dict[str, Any] = {
             "question_type": obj.get("question_type", "other"),
             "answer_form": obj.get("answer_form", "other"),
@@ -296,13 +410,16 @@ Respond with JSON ONLY:
             "entities": obj.get("entities", []),
             "constraints": obj.get("constraints", []),
             "notes": obj.get("notes", ""),
+            "slots": slots,
+            "subgoals": subgoals,
+            "final_composition": final_comp,
             "raw_json": obj,
         }
         return schema
 
     def _schema_summary(self, schema: Dict[str, Any]) -> str:
         """
-        把 schema 转成短文本，方便塞进 prompt 作为 hint
+        Render schema + slot graph into a short text hint for prompts.
         """
         qtype = schema.get("question_type", "other")
         ans_form = schema.get("answer_form", "other")
@@ -310,17 +427,50 @@ Respond with JSON ONLY:
         ents = schema.get("entities", [])
         cons = schema.get("constraints", [])
         notes = schema.get("notes", "")
+        slots = schema.get("slots", [])
+        subgoals = schema.get("subgoals", [])
+        final_comp = schema.get("final_composition", "")
 
         ent_lines = []
         for e in ents:
             name = (e.get("name") or "").strip()
             etype = (e.get("type") or "other").strip()
             role = (e.get("role") or "other").strip()
-            ent_lines.append(f"- {role}: '{name}' ({etype})")
+            aliases = e.get("aliases") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            alias_txt = ""
+            if aliases:
+                alias_txt = f", aliases={aliases}"
+            ent_lines.append(f"- {role}: '{name}' ({etype}{alias_txt})")
 
         ent_block = "\n".join(ent_lines) if ent_lines else "  (no explicit entities parsed)"
         cons_block = "\n".join(f"- {c}" for c in cons) if cons else "  (no explicit constraints)"
         notes_block = notes or "(no extra notes)"
+
+        slot_lines = []
+        for s in slots:
+            if not isinstance(s, dict):
+                continue
+            sid = (s.get("id") or "").strip() or "S?"
+            desc = (s.get("description") or "").strip()
+            req = bool(s.get("required"))
+            etype = (s.get("expected_type") or "unknown").strip()
+            req_flag = "required" if req else "optional"
+            slot_lines.append(f"- {sid} ({req_flag}, type={etype}): {desc}")
+        slot_block = "\n".join(slot_lines) if slot_lines else "  (no explicit slots)"
+
+        sg_lines = []
+        for g in subgoals:
+            if not isinstance(g, dict):
+                continue
+            gid = (g.get("id") or "").strip() or "G?"
+            desc = (g.get("description") or "").strip()
+            fills = [str(x).strip() for x in (g.get("fills_slots") or []) if str(x).strip()]
+            sg_lines.append(f"- {gid}: {desc} [fills_slots={fills}]")
+        subgoal_block = "\n".join(sg_lines) if sg_lines else "  (no explicit subgoals)"
+
+        final_comp_txt = final_comp or "(not specified)"
 
         return (
             f"Question type: {qtype}\n"
@@ -328,53 +478,24 @@ Respond with JSON ONLY:
             f"Answer focus: {focus}\n"
             f"Entities:\n{ent_block}\n"
             f"Constraints:\n{cons_block}\n"
-            f"Notes: {notes_block}"
+            f"Notes: {notes_block}\n"
+            f"Slots:\n{slot_block}\n"
+            f"Subgoals:\n{subgoal_block}\n"
+            f"Final composition: {final_comp_txt}"
         )
 
     # ---------- Stage 1: theta decomposes the question ----------
 
     def plan_subquestions(self, question: str, max_steps: int = 4) -> List[str]:
-        # 确保有 schema
+        # Ensure schema exists
         schema = self._ensure_schema(question)
         schema_summary = self._schema_summary(schema)
 
-        prompt = f"""
-You are the THETA agent in a dual-agent multi-hop reasoning system.
-
-FIRST, read the QUESTION_SCHEMA (already analyzed for you).
-Then, decompose the ORIGINAL QUESTION into 2 to {max_steps} ordered SUBQUESTIONS.
-
-Guidelines:
-- Each subquestion should be a simple fact-based question.
-- The sequence of subquestions should follow the schema:
-  - Respect the question_type and constraints.
-  - Ensure that the LAST subquestion directly prepares the information needed
-    to produce the final answer in the required ANSWER_FORM.
-- Do NOT answer the question here; only plan subquestions.
-
-QUESTION_SCHEMA (for reference, DO NOT rewrite it):
-{schema_summary}
-
-CRITICAL OUTPUT:
-- Respond with a SINGLE JSON object.
-- JSON keys:
-  - "subquestions": array of 2 to {max_steps} strings.
-
-Example:
-{{
-  "subquestions": [
-    "Who directed the film 'Move (1970 film)'?",
-    "What country is that director from?",
-    "Who directed 'Méditerranée (1963 film)'?",
-    "What country is that director from?"
-  ]
-}}
-
-ORIGINAL QUESTION:
-{question}
-
-Respond with JSON ONLY:
-""".strip()
+        prompt = get_prompt("plan_subquestions").format(
+            max_steps=max_steps,
+            schema_summary=schema_summary,
+            question=question,
+        ).strip()
 
         raw_text = self.llm.generate(
             prompt,
@@ -418,35 +539,17 @@ Respond with JSON ONLY:
         for step in previous_steps:
             gres = step.get("gamma_result", {}) or {}
             lines.append(
-                f"step {step.get('step_index')}: subquestion='{step.get('refined_subquestion', step.get('subquestion'))}', "
+                f"step {step.get('step_index')}: "
+                f"subquestion='{step.get('refined_subquestion', step.get('subquestion'))}', "
                 f"found={gres.get('found')}, answer={gres.get('answer')}"
             )
         history_block = "\n".join(lines)
 
-        prompt = f"""
-You are the THETA agent refining the next subquestion in a multi-hop QA task.
-
-You MUST:
-- Use the QUESTION_SCHEMA to preserve entity alignment and answer role.
-- Use PREVIOUS STEPS (gamma answers) to rewrite the NEXT_SUBQUESTION to be as specific as possible
-  (e.g., replace pronouns like "that director" with the actual name if confidently known).
-- If previous steps did NOT find a reliable answer (found=false or empty answer), KEEP the next subquestion unchanged.
-
-QUESTION_SCHEMA:
-{schema_summary}
-
-PREVIOUS STEPS:
-{history_block}
-
-NEXT_SUBQUESTION (planned):
-{planned_subquestion}
-
-CRITICAL OUTPUT:
-- Respond with a SINGLE JSON object:
-  - "subquestion": string (the rewritten subquestion to ask gamma)
-
-Respond with JSON ONLY:
-""".strip()
+        prompt = get_prompt("refine_subquestion").format(
+            schema_summary=schema_summary,
+            history_block=history_block,
+            planned_subquestion=planned_subquestion,
+        ).strip()
 
         raw_text = self.llm.generate(
             prompt,
@@ -465,7 +568,7 @@ Respond with JSON ONLY:
         except Exception:
             return planned_subquestion
 
-    # ---------- Stage 2: symbolic comparator + answer integration ----------
+    # ---------- Stage 2: symbolic comparator + multi-constraint hints ----------
 
     def _extract_years(self, text: str) -> List[int]:
         years: List[int] = []
@@ -478,26 +581,50 @@ Respond with JSON ONLY:
 
     def build_symbolic_schema(self, question: str, gamma_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Lightweight symbolic comparator / numeric hints:
+        Lightweight symbolic comparator + multi-constraint hints:
         - detect comparative keywords (older/younger/earlier/later/before/after).
+        - detect intersection / multi-constraint keywords (both, in common, shared, etc.).
         - extract numeric cues (years) from gamma answers and selected facts.
-        - provide a compact hint string for LLM to avoid small comparison slips.
+        - detect tokens that appear in answers of multiple steps (rough intersection candidates).
+        - provide a compact hint string for LLM to avoid small comparison slips
+          and to respect intersection-style constraints.
         """
         comparative_keywords = [
             "older", "younger", "earlier", "later", "before", "after",
             "first", "second", "younger than", "older than", "earlier than", "later than",
         ]
+        multi_keywords = [
+            "both", "all of the following", "all of", "each of",
+            "in common", "shared", "common to", "intersection",
+            "that are also", "who are also", "as well as",
+        ]
+
         q_lower = question.lower()
-        hits = [kw for kw in comparative_keywords if kw in q_lower]
-        is_comp = bool(hits)
+        comp_hits = [kw for kw in comparative_keywords if kw in q_lower]
+        multi_hits = [kw for kw in multi_keywords if kw in q_lower]
+        is_comp = bool(comp_hits)
+        is_multi = bool(multi_hits)
 
         entities = []
+        answer_tokens_per_step: List[List[str]] = []
+
         for step in gamma_results:
             gres = step.get("gamma_result", {}) or {}
             answer = str(gres.get("answer", "") or "")
             years = set(self._extract_years(answer))
             for ft in gres.get("selected_fact_texts", []) or []:
                 years.update(self._extract_years(str(ft)))
+
+            # Roughly extract possible candidate entity tokens from answers
+            tokens: List[str] = []
+            if answer:
+                parts = re.split(r",| and | & ", answer)
+                for p in parts:
+                    t = p.strip()
+                    if len(t) >= 3 and any(c.isalpha() for c in t):
+                        tokens.append(t)
+            answer_tokens_per_step.append(tokens)
+
             entities.append({
                 "step": step.get("step_index"),
                 "subq": step.get("refined_subquestion") or step.get("subquestion"),
@@ -505,12 +632,37 @@ Respond with JSON ONLY:
                 "years": sorted(years),
             })
 
+        # Collect intersection candidates: tokens appearing in answers of >=2 steps
+        token_counts: Dict[str, int] = {}
+        for ts in answer_tokens_per_step:
+            for t in set(ts):
+                token_counts[t] = token_counts.get(t, 0) + 1
+        intersection_candidates = [t for t, c in token_counts.items() if c >= 2]
+
         # Build a human-readable summary to feed into prompts
         lines = []
         if is_comp:
-            lines.append(f"Comparative keywords detected: {', '.join(hits)}.")
+            lines.append(f"Comparative keywords detected: {', '.join(comp_hits)}.")
         else:
             lines.append("No obvious comparative keywords detected.")
+
+        if is_multi:
+            lines.append(f"Multi-constraint / intersection keywords detected: {', '.join(multi_hits)}.")
+            if intersection_candidates:
+                lines.append(
+                    "Tokens that appear in answers of multiple steps "
+                    "(possible intersection candidates): "
+                    + "; ".join(intersection_candidates)
+                )
+            else:
+                lines.append(
+                    "No obvious intersection candidates detected from gamma answers; "
+                    "if the question requires satisfying multiple constraints, "
+                    "prefer entities supported by more than one step."
+                )
+        else:
+            lines.append("No obvious multi-constraint / intersection pattern detected.")
+
         for ent in entities:
             ytxt = ", ".join(str(y) for y in ent["years"]) if ent["years"] else "none"
             lines.append(f"Step {ent['step']}: answer='{ent['answer']}', years=[{ytxt}].")
@@ -518,9 +670,14 @@ Respond with JSON ONLY:
 
         return {
             "is_comparative": is_comp,
-            "keywords": hits,
+            "keywords": comp_hits,
             "entities": entities,
             "summary": summary,
+            "multi_constraint": {
+                "is_multi_constraint": is_multi,
+                "keywords": multi_hits,
+                "intersection_candidates": intersection_candidates,
+            },
         }
 
     def integrate_answer(
@@ -530,11 +687,11 @@ Respond with JSON ONLY:
         comparator_summary: str = "",
     ) -> Dict[str, Any]:
         """
-        把 question schema + gamma 结果 + 符号比较提示 三者一起喂给 LLM，
-        明确要求它：
-        - 回答形式要符合 schema.answer_form；
-        - 如果是 yes/no，就只回答 yes / no；
-        - 如果是 “which film/person...”，就输出对应实体，而不是中间推理节点。
+        Feed question schema + gamma results + comparator hints + multi-constraint hints
+        to the LLM and request a final answer with strict formatting:
+        - Answer must follow schema.answer_form.
+        - If yes/no: only “yes” or “no”.
+        - If “which film/person...”: output the entity, not intermediate reasoning nodes.
         """
         schema = self._ensure_schema(question)
         schema_summary = self._schema_summary(schema)
@@ -554,38 +711,12 @@ Respond with JSON ONLY:
             )
         gamma_summary = "\n\n".join(lines)
 
-        prompt = f"""
-You are the THETA agent. You must produce a FINAL ANSWER to the ORIGINAL QUESTION
-based on GAMMA's evidence, the QUESTION_SCHEMA, and the SYMBOLIC_COMPARATOR hints.
-
-STRICT RULES:
-1. Respect QUESTION_SCHEMA.answer_form:
-   - If "yes_no": the answer MUST be exactly "yes" or "no".
-   - If "entity_name": the answer MUST be the name of the required entity (film/person/city/etc.),
-     NOT a description, NOT an explanation, and NOT an intermediate node.
-   - If "number" or "date": output ONLY the number or date required.
-2. Your reasoning text should match the final answer logically.
-3. Do NOT change the task type. If the question asks for a FILM, do NOT answer with a PERSON.
-
-CRITICAL OUTPUT:
-- Respond with a SINGLE JSON object:
-  - "answer": string
-  - "reasoning": string (1-3 sentences in English)
-
-QUESTION_SCHEMA:
-{schema_summary}
-
-SYMBOLIC_COMPARATOR_HINTS:
-{comparator_summary}
-
-ORIGINAL QUESTION:
-{question}
-
-GAMMA_RESULTS:
-{gamma_summary}
-
-Respond with JSON ONLY:
-""".strip()
+        prompt = get_prompt("integrate_answer").format(
+            schema_summary=schema_summary,
+            comparator_summary=comparator_summary,
+            question=question,
+            gamma_summary=gamma_summary,
+        ).strip()
 
         raw_text = self.llm.generate(
             prompt,
@@ -641,11 +772,11 @@ Respond with JSON ONLY:
         else:
             ex_id = example.get("id", f"{self.dataset_name}_{example_index}")
 
-        # 0) 先构建 Question Schema（让后续都在这个 frame 下运转）
+        # 0) Build Question Schema first (everything else runs within this frame)
         try:
             schema = self._ensure_schema(question)
         except Exception as e:
-            # 某些环境下 schema 调用可能被封禁或网络异常，直接跳过该样本，避免中断全局
+            # In some environments the schema call may be blocked/network-failed; skip sample to avoid halting the run
             status = None
             resp_text = ""
             if isinstance(e, HTTPError) and e.response is not None:
@@ -665,9 +796,9 @@ Respond with JSON ONLY:
                     "skip_error_body": resp_text.strip(),
                 }
             raise
-        schema_summary = self._schema_summary(schema)  # 纯 log 用
+        schema_summary = self._schema_summary(schema)  # log-only
 
-        # 初始化 BridgeManager
+        # Initialize BridgeManager
         bridge_manager = self.bridge_manager_cls(question=question, schema=schema)
 
         # 1) theta: plan subquestions
@@ -682,7 +813,7 @@ Respond with JSON ONLY:
                     resp_text = e.response.text or ""
                 except Exception:
                     resp_text = ""
-            # 如果分解调用出现 403 / 网络错误，直接跳过当前样本
+            # If planning hits 403 / network errors, skip this sample
             if isinstance(e, (HTTPError, SSLError, ConnectionError, Timeout)) or status == 403 or "403" in str(e):
                 return {
                     "example_index": example_index,
@@ -717,7 +848,7 @@ Respond with JSON ONLY:
                 subquestion=refined_subq,
                 call_id=call_id,
             )
-            # BridgeManager: 检测这一步的锚点对齐情况，并做 gating
+            # BridgeManager: check anchor alignment for this step and apply gating
             bridge_meta = bridge_manager.update_step(
                 step_index=step_idx,
                 refined_subq=refined_subq,
@@ -738,7 +869,7 @@ Respond with JSON ONLY:
 
         # 2) Symbolic comparator / question schema (PFC+parietal helper)
         comparator = self.build_symbolic_schema(question, gamma_results)
-        comparator_summary = comparator.get("summary", "") if comparator.get("is_comparative") else ""
+        comparator_summary = comparator.get("summary", "")
 
         # 3) theta: integrate a preliminary answer (with comparator & schema hints)
         final = self.integrate_answer(question, gamma_results, comparator_summary=comparator_summary)
@@ -771,7 +902,12 @@ Respond with JSON ONLY:
             "bridge_manager": bridge_manager.to_dict(),
         }
 
-        llm_calls = getattr(self.llm, "call_log", [])
+        theta_calls = getattr(self.theta_llm, "call_log", []) if hasattr(self, "theta_llm") else getattr(self.llm, "call_log", [])
+        gamma_calls = getattr(self.gamma_llm, "call_log", []) if hasattr(self, "gamma_llm") else theta_calls
+        if theta_calls is gamma_calls:
+            llm_calls = theta_calls
+        else:
+            llm_calls = (theta_calls or []) + (gamma_calls or [])
 
         result = {
             "dataset": self.dataset_name,

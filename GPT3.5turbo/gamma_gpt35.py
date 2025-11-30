@@ -8,6 +8,8 @@ import time
 import requests
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from pathlib import Path
+import yaml
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -68,17 +70,31 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
             return obj
     raise ValueError(f"Cannot parse JSON from LLM output: {text[:200]}...")
 
-
 class LLMClient:
     """
-    Thin wrapper around the OpenRouter / OpenAI GPT-3.5 Turbo chat API.
+    Thin wrapper around the OpenRouter / OpenAI chat API.
     """
 
-    def __init__(self, call_log: Optional[List[Dict[str, Any]]] = None):
+    MODEL_ALIASES = {
+        # Friendly alias -> OpenRouter model id
+        "gpt-o3": "openai/o3-mini",
+        "openai/gpt-o3": "openai/o3-mini",
+    }
+
+    def __init__(
+        self,
+        call_log: Optional[List[Dict[str, Any]]] = None,
+        model_name: Optional[str] = None,
+        api_url: Optional[str] = None,
+        fallback_model_name: Optional[str] = None,
+    ):
         load_dotenv()
-        self.api_url = os.getenv("API_URL", "https://openrouter.ai/api/v1/chat/completions")
+        self.api_url = api_url or os.getenv("API_URL", "https://openrouter.ai/api/v1/chat/completions")
         # Default to OpenRouter GPT-3.5 Turbo identifier
-        self.model_name = os.getenv("MODEL_NAME", "openai/gpt-3.5-turbo")
+        requested_model = model_name or os.getenv("MODEL_NAME", "openai/gpt-3.5-turbo")
+        self.model_name = self.MODEL_ALIASES.get(requested_model, requested_model)
+        fb_requested = fallback_model_name or os.getenv("FALLBACK_MODEL_NAME")
+        self.fallback_model_name = self.MODEL_ALIASES.get(fb_requested, fb_requested) if fb_requested else None
         self.api_key = os.getenv("OPENROUTER_API_KEY", os.getenv("OPENAI_API_KEY", ""))
         self.call_log: List[Dict[str, Any]] = call_log if call_log is not None else []
 
@@ -99,6 +115,7 @@ class LLMClient:
         }
 
         MAX_RETRY = 5
+        attempted_fallback = False
         for attempt in range(1, MAX_RETRY + 1):
             try:
                 headers = {"Content-Type": "application/json"}
@@ -128,11 +145,31 @@ class LLMClient:
                 return text
 
             except Exception as e:
+                # Auto-fallback on missing endpoint if configured
+                if (
+                    not attempted_fallback
+                    and self.fallback_model_name
+                    and self.model_name != self.fallback_model_name
+                ):
+                    message = ""
+                    status = None
+                    if hasattr(e, "response") and e.response is not None:
+                        try:
+                            status = e.response.status_code
+                            message = e.response.text or ""
+                        except Exception:
+                            message = ""
+                    msg_lower = (message or "").lower()
+                    if status == 404 or "no endpoints found" in msg_lower:
+                        attempted_fallback = True
+                        self.model_name = self.fallback_model_name
+                        payload["model"] = self.model_name
+                        print(f"[LLMClient] Model endpoint missing, switching to fallback model '{self.model_name}'.")
+                        continue
                 if attempt == MAX_RETRY:
                     raise e
                 print(f"[LLMClient] Timeout or error, retrying ({attempt}/{MAX_RETRY})...")
                 time.sleep(3)  # wait 3 seconds then retry
-
 
 
 class GammaAgent:
@@ -144,6 +181,24 @@ class GammaAgent:
         assert dataset_name in {"2wiki", "hotpotqa", "musique"}
         self.dataset_name = dataset_name
         self.llm = llm_client
+        self._prompt_cache: Dict[str, str] = {}
+
+    # ---------- Prompt loading ----------
+
+    def _load_prompts(self) -> Dict[str, str]:
+        if self._prompt_cache:
+            return self._prompt_cache
+        prompt_path = Path(__file__).resolve().parent / "prompts" / "gamma_prompts.yaml"
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        self._prompt_cache = {str(k): str(v) for k, v in data.items()}
+        return self._prompt_cache
+
+    def _get_prompt(self, name: str) -> str:
+        prompts = self._load_prompts()
+        if name not in prompts:
+            raise KeyError(f"Prompt '{name}' not found")
+        return prompts[name]
 
     # ---------- Build facts for different datasets ----------
 
@@ -217,41 +272,10 @@ class GammaAgent:
             )
         facts_block = "\n\n".join(fact_lines)
 
-        prompt = f"""
-You are the gamma agent in a dual-agent multi-hop QA system.
-
-Your role:
-- Given a SUBQUESTION and a list of NUMBERED FACTS, pick the relevant facts.
-- If the facts are sufficient, extract a SHORT ANSWER phrase (a few words).
-- If the facts are NOT sufficient, you must say found = false and answer = null.
-
-CRITICAL OUTPUT REQUIREMENTS:
-- You MUST respond with a SINGLE valid JSON object.
-- Do NOT write any explanation outside JSON.
-- JSON keys:
-  - "found": a boolean
-  - "selected_fact_indices": array of integers (indices of used facts, possibly empty)
-  - "answer": a string or null
-  - "reasoning": a short one-sentence explanation in English
-
-Example of valid output:
-{{
-  "found": true,
-  "selected_fact_indices": [1, 3],
-  "answer": "Thomas Jefferson",
-  "reasoning": "Facts [1] and [3] show his role and birth state."
-}}
-
-Now process the input.
-
-SUBQUESTION:
-{subquestion}
-
-FACTS:
-{facts_block}
-
-Respond with JSON ONLY:
-""".strip()
+        prompt = self._get_prompt("gamma_answer").format(
+            subquestion=subquestion,
+            facts_block=facts_block,
+        ).strip()
 
         raw_text = self.llm.generate(
             prompt,
