@@ -1,160 +1,93 @@
 # theta_gpt35.py
 # Theta agent: orchestrates Gamma calls, applies ACC self-check,
-# question schema + slot graph, BridgeManager, and returns trace.
+# question schema + slot graph, and returns trace.
 
 from typing import Any, Dict, List, Optional
-from pathlib import Path
 import re
+import json
 from requests.exceptions import HTTPError, SSLError, ConnectionError, Timeout
-import yaml
 
 from gamma_gpt35 import LLMClient, GammaAgent, extract_json_from_text
 from acc_gpt35 import ACCAgent
 
 
-_PROMPT_CACHE: Dict[str, str] = {}
-
-
-def _load_prompts() -> Dict[str, str]:
-    global _PROMPT_CACHE
-    if _PROMPT_CACHE:
-        return _PROMPT_CACHE
-    prompt_path = Path(__file__).resolve().parent / "prompts" / "theta_prompts.yaml"
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    _PROMPT_CACHE = {str(k): str(v) for k, v in data.items()}
-    return _PROMPT_CACHE
-
-
-def get_prompt(name: str) -> str:
-    prompts = _load_prompts()
-    if name not in prompts:
-        raise KeyError(f"Prompt '{name}' not found")
-    return prompts[name]
-
-
 class BridgeManager:
     """
-    BridgeManager: lightweight “bridge” manager.
+    BridgeManager: lightweight anchor-alignment checker.
 
     Goals:
-    - Use schema entities plus previous Gamma entity answers as anchors for each subquestion.
+    - Use entities from the question schema plus explicit entity answers from earlier
+      Gamma steps as anchors for each subquestion.
     - Check whether Gamma-selected facts actually mention these anchors.
-    - If a subquestion clearly depends on anchors but selected facts omit them, mark the bridge
-      as unreliable: set bridge_ok=False and found=False (gating).
+    - If a subquestion clearly depends on anchors but the selected facts do not mention
+      them, treat the bridge as unreliable: set bridge_ok=False and found=False (gating).
 
-    This version adds:
-    - Support for entity aliases (schema.entities[*].aliases) as anchor forms.
-    - Simple pronoun alignment: if subquestions contain he/she/they/this film/that movie, use
-      the most recent Gamma answer as an anchor.
-    - Track hits by “wiki page group”; when the same anchor appears on a new page group, note it
-      to reduce cross-article drift (logging hint, not enforced gating).
-
-    Output per step:
+    Output:
+    - Per-step metadata:
       {
         "step_index": int,
-        "anchors": [...],          # anchors inferred for the current subquestion
-        "matched_anchors": [...],  # anchors actually matched in selected_fact_texts
+        "anchors": [...],
+        "matched_anchors": [...],
         "bridge_ok": bool,
-        "bridge_reason": str,
-        "page_titles": [...],      # rough page titles hit in this step
+        "bridge_reason": str
       }
-    The trace’s "bridge_manager" contains summary + anchor_pages for logging/analysis.
+    - trace["bridge_manager"] includes a summary for logging/analysis.
     """
 
     def __init__(self, question: str, schema: Dict[str, Any]):
         self.question = question
         self.schema = schema or {}
+        # Extract explicit entity names (and aliases if present) from the schema
+        self.schema_anchor_map: Dict[str, str] = self._extract_schema_anchors(schema)
+        self.schema_entities: List[str] = list(self.schema_anchor_map.values())
+        # Entity-style answers from previous Gamma steps
+        self.prev_answers: List[str] = []
+        # Bridge metadata per step
+        self.steps: List[Dict[str, Any]] = []
 
-        # Pull explicit entity names + aliases from the schema
-        # schema_entities: canonical names
-        # entity_alias_map: canonical name -> [alias1, alias2, ...]
-        # all_anchor_forms: every surface form usable as an anchor (name + alias)
-        self.schema_entities: List[str] = []
-        self.entity_alias_map: Dict[str, List[str]] = {}
-        self.all_anchor_forms: List[str] = []
-
-        for e in self.schema.get("entities", []) or []:
+    def _extract_schema_anchors(self, schema: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Build a canonical anchor map from schema.entities:
+        key = lowercase surface form or alias; value = canonical surface form.
+        """
+        anchors: Dict[str, str] = {}
+        for e in schema.get("entities", []) or []:
             name = (e.get("name") or "").strip()
             aliases = e.get("aliases") or e.get("alias") or []
             if isinstance(aliases, str):
                 aliases = [aliases]
-            aliases = [a.strip() for a in aliases if isinstance(a, str) and a.strip()]
-
-            if name:
-                self.schema_entities.append(name)
-                self.all_anchor_forms.append(name)
-                if aliases:
-                    self.entity_alias_map[name] = aliases
-                    self.all_anchor_forms.extend(aliases)
-
-        # Entity-style answers from previous Gamma steps
-        self.prev_answers: List[str] = []
-
-        # Record which rough page titles each anchor hit
-        # anchor_pages[anchor] = ["Title1", "Title2", ...]
-        self.anchor_pages: Dict[str, List[str]] = {}
-
-        # Per-step bridge records
-        self.steps: List[Dict[str, Any]] = []
+            forms = [name] if name else []
+            forms.extend([(a or "").strip() for a in aliases])
+            for form in forms:
+                if not form:
+                    continue
+                key = form.lower()
+                # prefer the longest surface form as canonical if conflicts
+                if key not in anchors or len(form) > len(anchors[key]):
+                    anchors[key] = form
+        return anchors
 
     def _extract_anchors_for_subquestion(self, subq: str) -> List[str]:
         """
         Extract anchor entities for the current refined_subquestion:
-        - Schema entity names or aliases that appear in the subquestion.
-        - Explicit answers from prior steps that appear in the subquestion.
-        - Simple pronoun alignment: if he/she/they/this film/etc. appear and there are
-          previous answers, use the most recent answer as an anchor.
+        - entity names from the schema that appear in this subquestion
+        - explicit answers from previous steps that appear in this subquestion
         """
         anchors = set()
-        sq = (subq or "")
-        sq_lower = sq.lower()
+        sq_lower = (subq or "").lower()
 
-        # Schema entities (name + alias)
-        for form in self.all_anchor_forms:
-            f = form.strip()
-            if f and f.lower() in sq_lower:
-                anchors.add(f)
+        # Schema entities (canonicalized)
+        for key, canonical in self.schema_anchor_map.items():
+            if key and key in sq_lower:
+                anchors.add(canonical)
 
-        # Prior answers as potential intermediate entities
+        # Previous answers as potential intermediate anchors
         for ans in self.prev_answers:
             a = ans.strip()
             if a and a.lower() in sq_lower:
                 anchors.add(a)
 
-        # Pronoun alignment: with pronouns + history, use the most recent answer as anchor
-        pronoun_markers = [
-            " he ", " she ", " they ", " him ", " her ", " them ",
-            " this person", " that person", " the person",
-            " this man", " that man", " this woman", " that woman",
-            " this film", " that film", " this movie", " that movie",
-            " the film", " the movie",
-        ]
-        padded = f" {sq_lower} "
-        if any(p in padded for p in pronoun_markers) and self.prev_answers:
-            last_ans = self.prev_answers[-1].strip()
-            if last_ans:
-                anchors.add(last_ans)
-
         return list(anchors)
-
-    def _extract_page_titles(self, selected_texts: List[Any]) -> List[str]:
-        """
-        Roughly extract “page titles” from selected_fact_texts:
-        prefer the part before a colon; otherwise take a short prefix.
-        """
-        titles = set()
-        for t in selected_texts or []:
-            s = str(t)
-            if ":" in s:
-                head = s.split(":", 1)[0].strip()
-                if head:
-                    titles.add(head)
-            else:
-                snippet = s[:80].strip()
-                if snippet:
-                    titles.add(snippet)
-        return sorted(titles)
 
     def update_step(
         self,
@@ -163,36 +96,33 @@ class BridgeManager:
         gamma_result: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Call after each Gamma step:
-        - Extract anchors from refined_subq.
-        - Check whether selected_fact_texts mention these anchors.
-        - If anchors exist but none are mentioned:
-            - bridge_ok=False
+        Run after each Gamma step:
+        - extract anchors from refined_subq
+        - check whether selected_fact_texts mention these anchors
+        - if anchors exist but none are matched:
+            - set bridge_ok=False
             - annotate gamma_result["reasoning"]
             - force gamma_result["found"]=False (gating)
-        - If still found and answer is a string, record it in prev_answers.
-        - Record page_titles and accumulate in anchor_pages.
+        - if this step is still found and answer is a string, save the answer for later steps
         """
         anchors = self._extract_anchors_for_subquestion(refined_subq)
         selected_texts = gamma_result.get("selected_fact_texts") or []
         big_text = " ".join(str(t) for t in selected_texts).lower()
-        page_titles = self._extract_page_titles(selected_texts)
-
         matched_anchors: List[str] = []
         if big_text:
             matched_anchors = [a for a in anchors if a.lower() in big_text]
 
         bridge_ok = True
-        bridge_reason_parts: List[str] = []
+        bridge_reason = ""
 
-        # Main gating: anchors exist but facts never mention them
         if anchors:
             if gamma_result.get("found"):
                 if not matched_anchors:
+                    # Clear anchors exist but selected facts never mention them: gate this step
                     bridge_ok = False
-                    bridge_reason_parts.append(
-                        "Gamma selected facts do not mention any anchor entities "
-                        "from schema/previous answers."
+                    bridge_reason = (
+                        "Gamma selected facts do not mention any anchor entities from "
+                        "schema/previous answers."
                     )
                     gamma_result["found"] = False
                     gamma_result.setdefault("reasoning", "")
@@ -202,37 +132,22 @@ class BridgeManager:
                             "treat as not found]"
                         )
             else:
-                # Already not found, and the subquestion needs anchors -> bridge breaks here
+                # No answer found and the subquestion has anchors -> bridge broken here
                 bridge_ok = False
-                bridge_reason_parts.append(
+                bridge_reason = (
                     "Gamma could not find an answer for a subquestion that depends on "
                     "anchor entities."
                 )
         else:
-            # No anchors detected: pass, no gating
+            # No anchors detected: pass through without gating
             bridge_ok = True
+            bridge_reason = ""
 
-        # Track page groups, note cross-page jumps
-        if matched_anchors and page_titles:
-            for a in matched_anchors:
-                prev_pages = set(self.anchor_pages.get(a, []))
-                new_pages = set(page_titles)
-                if prev_pages and not (prev_pages & new_pages):
-                    # Same anchor appears in a new page group: add a cross-page note
-                    bridge_reason_parts.append(
-                        f"Anchor '{a}' moved from pages {sorted(prev_pages)} "
-                        f"to new pages {sorted(new_pages)}."
-                    )
-                merged = sorted(prev_pages | new_pages) if prev_pages else sorted(new_pages)
-                self.anchor_pages[a] = merged
-
-        bridge_reason = " ".join(bridge_reason_parts).strip()
-
-        # Keep entity answers that are still considered found, for later steps
+        # Track entity answers still treated as found for later steps
         ans = gamma_result.get("answer")
         if gamma_result.get("found") and isinstance(ans, str) and ans.strip():
             self.prev_answers.append(ans.strip())
-            # Trim list to avoid overgrowth
+            # Trim history to avoid unbounded growth
             if len(self.prev_answers) > 6:
                 self.prev_answers = self.prev_answers[-6:]
 
@@ -242,7 +157,6 @@ class BridgeManager:
             "matched_anchors": matched_anchors,
             "bridge_ok": bridge_ok,
             "bridge_reason": bridge_reason,
-            "page_titles": page_titles,
         }
         self.steps.append(meta)
         return meta
@@ -262,7 +176,6 @@ class BridgeManager:
             lines.append(
                 f"step {s.get('step_index')}: bridge_ok={ok}, "
                 f"anchors={s.get('anchors')}, matched={s.get('matched_anchors')}, "
-                f"pages={s.get('page_titles')}, "
                 f"reason={s.get('bridge_reason')}"
             )
         if bad == 0:
@@ -278,40 +191,49 @@ class BridgeManager:
         return {
             "question": self.question,
             "schema_entities": list(self.schema_entities),
-            "entity_alias_map": dict(self.entity_alias_map),
-            "anchor_pages": dict(self.anchor_pages),
             "steps": list(self.steps),
             "summary": self.summary(),
         }
 
+
 class ThetaAgent:
     """
     Theta agent:
-    - Question schema analysis (task type, answer role, entities, slots, subgoals)
+    - Question schema analysis (task type, answer role, entities)
     - Plan subquestions (theta)
     - Dispatch gamma as needed
     - Dynamically rewrite later subquestions using previous answers
-    - Integrate the final answer (with symbolic & multi-constraint hints)
+    - Integrate the final answer (with symbolic comparator hints)
     - Call ACC for lightweight self-check
     - Return full trace (for logging / analysis)
     """
 
-    def __init__(self, dataset_name: str, llm_client: LLMClient, theta_llm_client: Optional[LLMClient] = None):
+    def __init__(
+        self,
+        dataset_name: str,
+        llm_client: LLMClient,
+        theta_llm_client: Optional[Any] = None,
+    ):
         assert dataset_name in {"2wiki", "hotpotqa", "musique"}
         self.dataset_name = dataset_name
-        # Gamma/ACC use the baseline client (e.g., gpt-3.5), while theta can use a separate model.
+        # Gamma / ACC stay on the baseline llm_client; theta can optionally use
+        # a separate client (e.g., Ollama) for planning/answering.
         self.gamma_llm = llm_client
         self.theta_llm = theta_llm_client or llm_client
         self.acc = ACCAgent(dataset_name=dataset_name, llm_client=self.gamma_llm)
         self.llm = self.theta_llm
         self.gamma = GammaAgent(dataset_name=dataset_name, llm_client=self.gamma_llm)
 
-        # BridgeManager class (swap implementation easily if needed)
+        # BridgeManager class (kept swappable for future implementations)
         self.bridge_manager_cls = BridgeManager
 
-        # Cache for the current sample's question schema (avoid repeat calls)
+        # Cache the schema per question to avoid recomputation
         self._schema_question: Optional[str] = None
         self._schema: Optional[Dict[str, Any]] = None
+
+        # Working memory cache (per question)
+        self._wm_question: Optional[str] = None
+        self._working_memory: Optional[Dict[str, Any]] = None
 
     # ---------- Question Schema Construction ----------
 
@@ -326,22 +248,117 @@ class ThetaAgent:
         self._schema = schema
         return schema
 
+    def _normalize_entities_from_obj(self, obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Robustly extract a list of {name,type,role} entities from the raw JSON object:
+        - If obj["entities"] is a list -> normalize each item.
+        - If obj itself looks like a single entity (has name/type/role) -> wrap into a list.
+        """
+        entities: List[Dict[str, Any]] = []
+
+        raw_entities = obj.get("entities", None)
+
+        # Case 1: well-formed entities list
+        if isinstance(raw_entities, list):
+            for e in raw_entities:
+                if not isinstance(e, dict):
+                    continue
+                name = str(e.get("name", "")).strip()
+                etype = str(e.get("type", "other")).strip() or "other"
+                role = str(e.get("role", "other")).strip() or "other"
+                if name:
+                    entities.append(
+                        {
+                            "name": name,
+                            "type": etype,
+                            "role": role,
+                        }
+                    )
+        # Case 2: entities is a single dict
+        elif isinstance(raw_entities, dict):
+            name = str(raw_entities.get("name", "")).strip()
+            etype = str(raw_entities.get("type", "other")).strip() or "other"
+            role = str(raw_entities.get("role", "other")).strip() or "other"
+            if name:
+                entities.append(
+                    {
+                        "name": name,
+                        "type": etype,
+                        "role": role,
+                    }
+                )
+
+        # Case 3: no "entities" field, but top-level object looks like an entity
+        if not entities and isinstance(obj, dict):
+            if {"name", "type", "role"}.issubset(set(obj.keys())):
+                name = str(obj.get("name", "")).strip()
+                etype = str(obj.get("type", "other")).strip() or "other"
+                role = str(obj.get("role", "other")).strip() or "other"
+                if name:
+                    entities.append(
+                        {
+                            "name": name,
+                            "type": etype,
+                            "role": role,
+                        }
+                    )
+
+        return entities
+
     def build_question_schema(self, question: str) -> Dict[str, Any]:
         """
-        Build a Question Schema + Slot Graph:
+        Build a lightweight Question Schema:
         - question_type: yes_no / comparison / fact / count / other
         - answer_form: yes_no / entity_name / number / date / span / other
         - focus: person / film / location / organization / other (hint only)
-        - entities: [{"name": ..., "type": ..., "role": ..., "aliases": [...]}, ...]
-        - constraints / notes: task rules & other hints
-        - slots: intermediate slots (id / description / required / expected_type)
-        - subgoals: subgoals (id / description / fills_slots)
-        - final_composition: how to combine slot values into the final answer
+        - entities: [{"name": ..., "type": ..., "role": ...}, ...]
+        - constraints / notes: task rules and other notes
         """
-        prompt = get_prompt("question_schema").format(
-            dataset_name=self.dataset_name,
-            question=question,
-        ).strip()
+        prompt = f"""
+        You are a QUESTION SCHEMA ANALYZER for a multi-hop QA system (THETA-GAMMA).
+
+        Given the ORIGINAL QUESTION, you must produce a compact schema that describes:
+        - The task type (yes/no, comparison, fact lookup, count, etc.).
+        - The expected answer form (yes/no, entity name, number, date, etc.).
+        - The main entities involved and their roles.
+        - Any key constraints or multi-hop structure.
+
+        CRITICAL:
+        Return a SINGLE JSON object with keys:
+        - "question_type": one of ["yes_no", "comparison", "fact", "count", "other"]
+        - "answer_form": one of ["yes_no", "entity_name", "number", "date", "span", "other"]
+        - "focus": short phrase for what the answer is about (e.g., "film", "person", "city", "organization", "generic").
+        - "entities": array of objects, each:
+                {{
+                "name": string,              # surface form in the question if any
+                "type": string,              # e.g., "person", "film", "city", "organization", "other"
+                "role": string               # e.g., "subject", "candidate1", "candidate2", "pivot", "target"
+                }}
+        - "constraints": array of short strings describing important logical conditions.
+        - "notes": short English description of how the question should be solved and what the final answer must look like.
+
+        Example output:
+        {{
+        "question_type": "comparison",
+        "answer_form": "entity_name",
+        "focus": "film",
+        "entities": [
+            {{"name": "Charge It To Me", "type": "film", "role": "candidate1"}},
+            {{"name": "Danger: Diabolik", "type": "film", "role": "candidate2"}},
+            {{"name": "", "type": "person", "role": "director"}}
+        ],
+        "constraints": [
+            "compare which director is younger",
+            "answer must be the film whose director is younger"
+        ],
+        "notes": "Two-hop: find each film's director, then compare their ages and answer with the film title."
+        }}
+
+        ORIGINAL QUESTION:
+        {question}
+
+        Respond with JSON ONLY:
+        """.strip()
 
         raw_text = self.llm.generate(
             prompt,
@@ -358,68 +375,55 @@ class ThetaAgent:
             obj = extract_json_from_text(raw_text)
             if not isinstance(obj, dict):
                 raise ValueError("schema must be an object")
+            # Some models wrap the schema inside a 'schema' field; unwrap if present.
+            if isinstance(obj.get("schema"), dict):
+                obj = obj["schema"]
         except Exception:
             obj = {}
 
-        # Extract slots / subgoals / final_composition with correct types
-        slots = obj.get("slots") or []
-        if not isinstance(slots, list):
-            slots = []
-        subgoals = obj.get("subgoals") or []
-        if not isinstance(subgoals, list):
-            subgoals = []
-        final_comp = obj.get("final_composition") or obj.get("final_answer_composition") or ""
-        if not isinstance(final_comp, str):
-            final_comp = str(final_comp)
+        # Fallback: try to parse a fenced ```json ... ``` block if keys are missing
+        if not obj.get("question_type") or not obj.get("answer_form"):
+            import re  # local import to avoid polluting module scope
 
-        # Enforce: every required slot has at least one subgoal bound
-        slot_ids_required = {str(s.get("id")).strip()
-                             for s in slots
-                             if isinstance(s, dict) and s.get("required") and str(s.get("id")).strip()}
-        filled_ids = set()
-        for g in subgoals:
-            if not isinstance(g, dict):
-                continue
-            for sid in g.get("fills_slots") or []:
-                sid_str = str(sid).strip()
-                if sid_str:
-                    filled_ids.add(sid_str)
-        missing_ids = sorted(slot_ids_required - filled_ids)
-        if missing_ids:
-            for mid in missing_ids:
-                # Find the slot description
-                desc = ""
-                for s in slots:
-                    if isinstance(s, dict) and str(s.get("id")).strip() == mid:
-                        desc = (s.get("description") or "").strip()
+            code_blocks = re.findall(r"```json(.*?)```", raw_text, flags=re.DOTALL | re.IGNORECASE)
+            for block in reversed(code_blocks):
+                try:
+                    cand = json.loads(block)
+                    if isinstance(cand, dict):
+                        if isinstance(cand.get("schema"), dict):
+                            cand = cand["schema"]
+                        obj = cand
                         break
-                auto_id = f"auto_{mid}"
-                subgoals.append(
-                    {
-                        "id": auto_id,
-                        "description": desc or f"Resolve slot {mid}",
-                        "fills_slots": [mid],
-                    }
-                )
+                except Exception:
+                    continue
 
-        # Fill defaults to avoid downstream KeyErrors
+        # Normalize entities from whatever shape the model returned
+        entities = self._normalize_entities_from_obj(obj)
+
+        # Normalize constraints to a list of strings
+        raw_constraints = obj.get("constraints", [])
+        if isinstance(raw_constraints, list):
+            constraints = [str(c).strip() for c in raw_constraints if str(c).strip()]
+        elif isinstance(raw_constraints, str) and raw_constraints.strip():
+            constraints = [raw_constraints.strip()]
+        else:
+            constraints = []
+
         schema: Dict[str, Any] = {
             "question_type": obj.get("question_type", "other"),
             "answer_form": obj.get("answer_form", "other"),
             "focus": obj.get("focus", "generic"),
-            "entities": obj.get("entities", []),
-            "constraints": obj.get("constraints", []),
+            "entities": entities,
+            "constraints": constraints,
             "notes": obj.get("notes", ""),
-            "slots": slots,
-            "subgoals": subgoals,
-            "final_composition": final_comp,
             "raw_json": obj,
+            "raw_text": raw_text,
         }
         return schema
 
     def _schema_summary(self, schema: Dict[str, Any]) -> str:
         """
-        Render schema + slot graph into a short text hint for prompts.
+        Convert the schema into short text for prompt hints.
         """
         qtype = schema.get("question_type", "other")
         ans_form = schema.get("answer_form", "other")
@@ -427,50 +431,17 @@ class ThetaAgent:
         ents = schema.get("entities", [])
         cons = schema.get("constraints", [])
         notes = schema.get("notes", "")
-        slots = schema.get("slots", [])
-        subgoals = schema.get("subgoals", [])
-        final_comp = schema.get("final_composition", "")
 
         ent_lines = []
         for e in ents:
             name = (e.get("name") or "").strip()
             etype = (e.get("type") or "other").strip()
             role = (e.get("role") or "other").strip()
-            aliases = e.get("aliases") or []
-            if isinstance(aliases, str):
-                aliases = [aliases]
-            alias_txt = ""
-            if aliases:
-                alias_txt = f", aliases={aliases}"
-            ent_lines.append(f"- {role}: '{name}' ({etype}{alias_txt})")
+            ent_lines.append(f"- {role}: '{name}' ({etype})")
 
         ent_block = "\n".join(ent_lines) if ent_lines else "  (no explicit entities parsed)"
         cons_block = "\n".join(f"- {c}" for c in cons) if cons else "  (no explicit constraints)"
         notes_block = notes or "(no extra notes)"
-
-        slot_lines = []
-        for s in slots:
-            if not isinstance(s, dict):
-                continue
-            sid = (s.get("id") or "").strip() or "S?"
-            desc = (s.get("description") or "").strip()
-            req = bool(s.get("required"))
-            etype = (s.get("expected_type") or "unknown").strip()
-            req_flag = "required" if req else "optional"
-            slot_lines.append(f"- {sid} ({req_flag}, type={etype}): {desc}")
-        slot_block = "\n".join(slot_lines) if slot_lines else "  (no explicit slots)"
-
-        sg_lines = []
-        for g in subgoals:
-            if not isinstance(g, dict):
-                continue
-            gid = (g.get("id") or "").strip() or "G?"
-            desc = (g.get("description") or "").strip()
-            fills = [str(x).strip() for x in (g.get("fills_slots") or []) if str(x).strip()]
-            sg_lines.append(f"- {gid}: {desc} [fills_slots={fills}]")
-        subgoal_block = "\n".join(sg_lines) if sg_lines else "  (no explicit subgoals)"
-
-        final_comp_txt = final_comp or "(not specified)"
 
         return (
             f"Question type: {qtype}\n"
@@ -478,24 +449,173 @@ class ThetaAgent:
             f"Answer focus: {focus}\n"
             f"Entities:\n{ent_block}\n"
             f"Constraints:\n{cons_block}\n"
-            f"Notes: {notes_block}\n"
-            f"Slots:\n{slot_block}\n"
-            f"Subgoals:\n{subgoal_block}\n"
-            f"Final composition: {final_comp_txt}"
+            f"Notes: {notes_block}"
         )
+
+    # ---------- Working Memory (explicit variable-style memory) ----------
+
+    def _build_working_memory(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build a structured WORKING_MEMORY object from the schema.
+        This is the "variable-style" working memory:
+        - entities have stable ids E1, E2, ... and canonical names/types/roles.
+        """
+        wm_entities: List[Dict[str, Any]] = []
+        for i, e in enumerate(schema.get("entities", []) or []):
+            wm_entities.append(
+                {
+                    "id": f"E{i + 1}",
+                    "name": (e.get("name") or "").strip(),
+                    "type": (e.get("type") or "other").strip() or "other",
+                    "role": (e.get("role") or "other").strip() or "other",
+                }
+            )
+
+        wm = {
+            "question_type": schema.get("question_type", "other"),
+            "answer_form": schema.get("answer_form", "other"),
+            "focus": schema.get("focus", "generic"),
+            "entities": wm_entities,
+            "constraints": schema.get("constraints", []),
+        }
+        return wm
+
+    def _ensure_working_memory(self, question: str) -> Dict[str, Any]:
+        """
+        Ensure that working memory is built and cached for this question.
+        """
+        if self._working_memory is not None and self._wm_question == question:
+            return self._working_memory
+        schema = self._ensure_schema(question)
+        wm = self._build_working_memory(schema)
+        self._working_memory = wm
+        self._wm_question = question
+        return wm
+
+    # ---------- Entity canonicalization helpers ----------
+
+    def _build_entity_canonical_map(self, schema: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Build a canonical map from schema.entities:
+        - key: lowercase surface forms (name / alias)
+        - value: canonical name from the schema (prefer longer/more complete names)
+        """
+        mapping: Dict[str, str] = {}
+        for e in schema.get("entities", []) or []:
+            name = (e.get("name") or "").strip()
+            if not name:
+                continue
+            forms = {name}
+            # Include aliases when provided (raw_json fields)
+            aliases = e.get("aliases") or e.get("alias") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            for a in aliases:
+                a = (a or "").strip()
+                if a:
+                    forms.add(a)
+
+            for form in forms:
+                key = form.lower()
+                # Keep the longer name if the key collides
+                if key in mapping:
+                    if len(name) > len(mapping[key]):
+                        mapping[key] = name
+                else:
+                    mapping[key] = name
+        return mapping
+
+    def _canonicalize_with_schema(self, text: str, schema: Dict[str, Any]) -> str:
+        """
+        Normalize entity mentions in text to canonical forms from the schema.
+        For example:
+        - "the game" / "The Game" / "THE GAME" -> "The Game"
+        - Prevent the LLM from drifting "The Game" into a vague mention
+        """
+        if not text:
+            return text
+        mapping = self._build_entity_canonical_map(schema)
+        if not mapping:
+            return text
+
+        # Replace from longest to shortest keys to avoid truncating longer entities
+        items = sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True)
+        result = text
+        for form_lower, canonical in items:
+            if not form_lower:
+                continue
+            # \b + IGNORECASE keeps the schema surface form instead of LLM paraphrases
+            pattern = re.compile(rf"\b{re.escape(form_lower)}\b", flags=re.IGNORECASE)
+            result = pattern.sub(canonical, result)
+        return result
 
     # ---------- Stage 1: theta decomposes the question ----------
 
     def plan_subquestions(self, question: str, max_steps: int = 4) -> List[str]:
-        # Ensure schema exists
+        # Ensure schema & working memory are prepared
         schema = self._ensure_schema(question)
+        wm = self._ensure_working_memory(question)
         schema_summary = self._schema_summary(schema)
+        wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
 
-        prompt = get_prompt("plan_subquestions").format(
-            max_steps=max_steps,
-            schema_summary=schema_summary,
-            question=question,
-        ).strip()
+        prompt = f"""
+You are the THETA agent in a dual-agent multi-hop reasoning system.
+
+You have two inputs:
+1) QUESTION_SCHEMA_JSON: a compact analysis of the question.
+2) WORKING_MEMORY: a variable-style memory that contains canonical entities from the question.
+
+WORKING_MEMORY:
+- You MUST treat WORKING_MEMORY.entities as the authoritative list of entities.
+- Each entity has an id (E1, E2, ...) and a canonical "name", "type", "role".
+- When you write SUBQUESTIONS, you MUST NOT invent or paraphrase entity names.
+  Instead, you MUST copy the exact "name" field from WORKING_MEMORY.entities[*].
+  For example, if WORKING_MEMORY.entities has:
+    {{"id": "E1", "name": "The Game", "type": "film", "role": "subject"}}
+  then in your subquestions you MUST use "The Game" exactly (same casing and spacing),
+  NOT "the game", NOT "that game", NOT any paraphrase.
+
+TASK:
+Decompose the ORIGINAL QUESTION into 2 to {max_steps} ordered SUBQUESTIONS.
+
+Guidelines:
+- Each subquestion should be a simple fact-based question.
+- The sequence of subquestions should follow the schema:
+  - Respect the question_type and constraints.
+  - Ensure that the LAST subquestion directly prepares the information needed
+    to produce the final answer in the required ANSWER_FORM.
+
+Do NOT answer the question here; only plan subquestions.
+
+QUESTION_SCHEMA_JSON (for reference, do NOT rewrite it):
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+QUESTION_SCHEMA_SUMMARY (for human readability):
+{schema_summary}
+
+WORKING_MEMORY (authoritative, do NOT modify):
+{wm_json}
+
+CRITICAL OUTPUT:
+- Respond with a SINGLE JSON object.
+- JSON keys:
+  - "subquestions": array of 2 to {max_steps} strings.
+
+Example:
+{{
+  "subquestions": [
+    "Who directed the film 'Move (1970 film)'?",
+    "What country is that director from?",
+    "Who directed 'Méditerranée (1963 film)'?",
+    "What country is that director from?"
+  ]
+}}
+
+ORIGINAL QUESTION:
+{question}
+
+Respond with JSON ONLY:
+""".strip()
 
         raw_text = self.llm.generate(
             prompt,
@@ -513,9 +633,12 @@ class ThetaAgent:
             subs = [str(x).strip() for x in subs if str(x).strip()]
             if not subs:
                 subs = [question]
+            # Canonicalize entity names with the schema to avoid drift
+            subs = [self._canonicalize_with_schema(s, schema) for s in subs]
             return subs[:max_steps]
         except Exception:
-            return [question]
+            # Fallback: still canonicalize to keep entity names stable
+            return [self._canonicalize_with_schema(question, schema)]
 
     def refine_subquestion(
         self,
@@ -525,31 +648,61 @@ class ThetaAgent:
     ) -> str:
         """
         Rewrite the planned_subquestion using earlier Gamma answers to be more specific,
-        while respecting the QUESTION_SCHEMA (answer role, entity alignment).
+        while respecting the QUESTION_SCHEMA and WORKING_MEMORY (entity alignment).
         If no reliable answer yet (found=false or answer empty), keep it unchanged.
         """
         if not previous_steps:
             return planned_subquestion
 
         schema = self._ensure_schema(question)
+        wm = self._ensure_working_memory(question)
         schema_summary = self._schema_summary(schema)
+        wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
 
         # Summarize previous steps
         lines = []
         for step in previous_steps:
             gres = step.get("gamma_result", {}) or {}
             lines.append(
-                f"step {step.get('step_index')}: "
-                f"subquestion='{step.get('refined_subquestion', step.get('subquestion'))}', "
+                f"step {step.get('step_index')}: subquestion='{step.get('refined_subquestion', step.get('subquestion'))}', "
                 f"found={gres.get('found')}, answer={gres.get('answer')}"
             )
         history_block = "\n".join(lines)
 
-        prompt = get_prompt("refine_subquestion").format(
-            schema_summary=schema_summary,
-            history_block=history_block,
-            planned_subquestion=planned_subquestion,
-        ).strip()
+        prompt = f"""
+You are the THETA agent refining the next subquestion in a multi-hop QA task.
+
+You have WORKING_MEMORY that encodes entities as variables (E1, E2, ...),
+and QUESTION_SCHEMA that describes the overall task.
+
+RULES:
+- Use QUESTION_SCHEMA and WORKING_MEMORY to preserve entity alignment and answer role.
+- When mentioning entities in the refined subquestion, ALWAYS use the exact "name"
+  from WORKING_MEMORY.entities[*].name. Do NOT change "The Game" into "the game",
+  and do NOT drop qualifiers like "(film)".
+- Use PREVIOUS STEPS (gamma answers) to rewrite the NEXT_SUBQUESTION to be as specific as possible
+  (e.g., replace pronouns like "that director" with the actual name if confidently known),
+  BUT you MUST still respect WORKING_MEMORY.entities for the canonical surface forms.
+- If previous steps did NOT find a reliable answer (found=false or empty answer), KEEP the next subquestion unchanged.
+
+QUESTION_SCHEMA_SUMMARY:
+{schema_summary}
+
+WORKING_MEMORY (authoritative, do NOT modify):
+{wm_json}
+
+PREVIOUS STEPS:
+{history_block}
+
+NEXT_SUBQUESTION (planned):
+{planned_subquestion}
+
+CRITICAL OUTPUT:
+- Respond with a SINGLE JSON object:
+  - "subquestion": string (the refined subquestion to ask gamma)
+
+Respond with JSON ONLY:
+""".strip()
 
         raw_text = self.llm.generate(
             prompt,
@@ -563,12 +716,16 @@ class ThetaAgent:
 
         try:
             obj = extract_json_from_text(raw_text)
-            refined = obj.get("subquestion", "").strip()
-            return refined if refined else planned_subquestion
+            refined_raw = obj.get("subquestion", "").strip()
+            refined = refined_raw if refined_raw else planned_subquestion
+            # Canonicalize again with the schema so entity names stay unchanged
+            refined = self._canonicalize_with_schema(refined, schema)
+            return refined
         except Exception:
-            return planned_subquestion
+            # Fallback: canonicalize the planned subquestion
+            return self._canonicalize_with_schema(planned_subquestion, schema)
 
-    # ---------- Stage 2: symbolic comparator + multi-constraint hints ----------
+    # ---------- Stage 2: symbolic comparator + answer integration ----------
 
     def _extract_years(self, text: str) -> List[int]:
         years: List[int] = []
@@ -581,50 +738,26 @@ class ThetaAgent:
 
     def build_symbolic_schema(self, question: str, gamma_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Lightweight symbolic comparator + multi-constraint hints:
+        Lightweight symbolic comparator / numeric hints:
         - detect comparative keywords (older/younger/earlier/later/before/after).
-        - detect intersection / multi-constraint keywords (both, in common, shared, etc.).
         - extract numeric cues (years) from gamma answers and selected facts.
-        - detect tokens that appear in answers of multiple steps (rough intersection candidates).
-        - provide a compact hint string for LLM to avoid small comparison slips
-          and to respect intersection-style constraints.
+        - provide a compact hint string for LLM to avoid small comparison slips.
         """
         comparative_keywords = [
             "older", "younger", "earlier", "later", "before", "after",
             "first", "second", "younger than", "older than", "earlier than", "later than",
         ]
-        multi_keywords = [
-            "both", "all of the following", "all of", "each of",
-            "in common", "shared", "common to", "intersection",
-            "that are also", "who are also", "as well as",
-        ]
-
         q_lower = question.lower()
-        comp_hits = [kw for kw in comparative_keywords if kw in q_lower]
-        multi_hits = [kw for kw in multi_keywords if kw in q_lower]
-        is_comp = bool(comp_hits)
-        is_multi = bool(multi_hits)
+        hits = [kw for kw in comparative_keywords if kw in q_lower]
+        is_comp = bool(hits)
 
         entities = []
-        answer_tokens_per_step: List[List[str]] = []
-
         for step in gamma_results:
             gres = step.get("gamma_result", {}) or {}
             answer = str(gres.get("answer", "") or "")
             years = set(self._extract_years(answer))
             for ft in gres.get("selected_fact_texts", []) or []:
                 years.update(self._extract_years(str(ft)))
-
-            # Roughly extract possible candidate entity tokens from answers
-            tokens: List[str] = []
-            if answer:
-                parts = re.split(r",| and | & ", answer)
-                for p in parts:
-                    t = p.strip()
-                    if len(t) >= 3 and any(c.isalpha() for c in t):
-                        tokens.append(t)
-            answer_tokens_per_step.append(tokens)
-
             entities.append({
                 "step": step.get("step_index"),
                 "subq": step.get("refined_subquestion") or step.get("subquestion"),
@@ -632,37 +765,12 @@ class ThetaAgent:
                 "years": sorted(years),
             })
 
-        # Collect intersection candidates: tokens appearing in answers of >=2 steps
-        token_counts: Dict[str, int] = {}
-        for ts in answer_tokens_per_step:
-            for t in set(ts):
-                token_counts[t] = token_counts.get(t, 0) + 1
-        intersection_candidates = [t for t, c in token_counts.items() if c >= 2]
-
         # Build a human-readable summary to feed into prompts
         lines = []
         if is_comp:
-            lines.append(f"Comparative keywords detected: {', '.join(comp_hits)}.")
+            lines.append(f"Comparative keywords detected: {', '.join(hits)}.")
         else:
             lines.append("No obvious comparative keywords detected.")
-
-        if is_multi:
-            lines.append(f"Multi-constraint / intersection keywords detected: {', '.join(multi_hits)}.")
-            if intersection_candidates:
-                lines.append(
-                    "Tokens that appear in answers of multiple steps "
-                    "(possible intersection candidates): "
-                    + "; ".join(intersection_candidates)
-                )
-            else:
-                lines.append(
-                    "No obvious intersection candidates detected from gamma answers; "
-                    "if the question requires satisfying multiple constraints, "
-                    "prefer entities supported by more than one step."
-                )
-        else:
-            lines.append("No obvious multi-constraint / intersection pattern detected.")
-
         for ent in entities:
             ytxt = ", ".join(str(y) for y in ent["years"]) if ent["years"] else "none"
             lines.append(f"Step {ent['step']}: answer='{ent['answer']}', years=[{ytxt}].")
@@ -670,14 +778,9 @@ class ThetaAgent:
 
         return {
             "is_comparative": is_comp,
-            "keywords": comp_hits,
+            "keywords": hits,
             "entities": entities,
             "summary": summary,
-            "multi_constraint": {
-                "is_multi_constraint": is_multi,
-                "keywords": multi_hits,
-                "intersection_candidates": intersection_candidates,
-            },
         }
 
     def integrate_answer(
@@ -687,11 +790,11 @@ class ThetaAgent:
         comparator_summary: str = "",
     ) -> Dict[str, Any]:
         """
-        Feed question schema + gamma results + comparator hints + multi-constraint hints
-        to the LLM and request a final answer with strict formatting:
-        - Answer must follow schema.answer_form.
-        - If yes/no: only “yes” or “no”.
-        - If “which film/person...”: output the entity, not intermediate reasoning nodes.
+        Feed the question schema, gamma results, and symbolic comparator hints to the LLM,
+        with explicit requirements:
+        - Answer form must follow schema.answer_form.
+        - If yes/no, answer strictly yes or no.
+        - If asking for a specific entity (film/person/etc.), output that entity, not an intermediate node.
         """
         schema = self._ensure_schema(question)
         schema_summary = self._schema_summary(schema)
@@ -711,12 +814,38 @@ class ThetaAgent:
             )
         gamma_summary = "\n\n".join(lines)
 
-        prompt = get_prompt("integrate_answer").format(
-            schema_summary=schema_summary,
-            comparator_summary=comparator_summary,
-            question=question,
-            gamma_summary=gamma_summary,
-        ).strip()
+        prompt = f"""
+You are the THETA agent. You must produce a FINAL ANSWER to the ORIGINAL QUESTION
+based on GAMMA's evidence, the QUESTION_SCHEMA, and the SYMBOLIC_COMPARATOR hints.
+
+STRICT RULES:
+1. Respect QUESTION_SCHEMA.answer_form:
+   - If "yes_no": the answer MUST be exactly "yes" or "no".
+   - If "entity_name": the answer MUST be the name of the required entity (film/person/city/etc.),
+     NOT a description, NOT an explanation, and NOT an intermediate node.
+   - If "number" or "date": output ONLY the number or date required.
+2. Your reasoning text should match the final answer logically.
+3. Do NOT change the task type. If the question asks for a FILM, do NOT answer with a PERSON.
+
+CRITICAL OUTPUT:
+- Respond with a SINGLE JSON object:
+  - "answer": string
+  - "reasoning": string (1-3 sentences in English)
+
+QUESTION_SCHEMA_SUMMARY:
+{schema_summary}
+
+SYMBOLIC_COMPARATOR_HINTS:
+{comparator_summary}
+
+ORIGINAL QUESTION:
+{question}
+
+GAMMA_RESULTS:
+{gamma_summary}
+
+Respond with JSON ONLY:
+""".strip()
 
         raw_text = self.llm.generate(
             prompt,
@@ -772,11 +901,12 @@ class ThetaAgent:
         else:
             ex_id = example.get("id", f"{self.dataset_name}_{example_index}")
 
-        # 0) Build Question Schema first (everything else runs within this frame)
+        # 0) Build the Question Schema first so later steps share the same frame
         try:
             schema = self._ensure_schema(question)
+            wm = self._ensure_working_memory(question)
         except Exception as e:
-            # In some environments the schema call may be blocked/network-failed; skip sample to avoid halting the run
+            # In some environments schema calls may fail (blocked or network); skip the sample to keep the run going
             status = None
             resp_text = ""
             if isinstance(e, HTTPError) and e.response is not None:
@@ -796,7 +926,7 @@ class ThetaAgent:
                     "skip_error_body": resp_text.strip(),
                 }
             raise
-        schema_summary = self._schema_summary(schema)  # log-only
+        schema_summary = self._schema_summary(schema)  # logging only
 
         # Initialize BridgeManager
         bridge_manager = self.bridge_manager_cls(question=question, schema=schema)
@@ -813,7 +943,7 @@ class ThetaAgent:
                     resp_text = e.response.text or ""
                 except Exception:
                     resp_text = ""
-            # If planning hits 403 / network errors, skip this sample
+            # If planning hits 403/network issues, skip this sample
             if isinstance(e, (HTTPError, SSLError, ConnectionError, Timeout)) or status == 403 or "403" in str(e):
                 return {
                     "example_index": example_index,
@@ -847,8 +977,9 @@ class ThetaAgent:
                 example=example,
                 subquestion=refined_subq,
                 call_id=call_id,
+                schema=schema,  # Pass schema so Gamma can prioritize titles/anchors
             )
-            # BridgeManager: check anchor alignment for this step and apply gating
+            # BridgeManager: check anchor alignment for this step and gate if needed
             bridge_meta = bridge_manager.update_step(
                 step_index=step_idx,
                 refined_subq=refined_subq,
@@ -869,7 +1000,7 @@ class ThetaAgent:
 
         # 2) Symbolic comparator / question schema (PFC+parietal helper)
         comparator = self.build_symbolic_schema(question, gamma_results)
-        comparator_summary = comparator.get("summary", "")
+        comparator_summary = comparator.get("summary", "") if comparator.get("is_comparative") else ""
 
         # 3) theta: integrate a preliminary answer (with comparator & schema hints)
         final = self.integrate_answer(question, gamma_results, comparator_summary=comparator_summary)
@@ -890,6 +1021,7 @@ class ThetaAgent:
         trace = {
             "question_schema": schema,
             "question_schema_summary": schema_summary,
+            "working_memory": wm,
             "planned_subquestions": subquestions,
             "executed_subquestions": executed_subquestions,
             "gamma_results": gamma_results,
@@ -902,12 +1034,7 @@ class ThetaAgent:
             "bridge_manager": bridge_manager.to_dict(),
         }
 
-        theta_calls = getattr(self.theta_llm, "call_log", []) if hasattr(self, "theta_llm") else getattr(self.llm, "call_log", [])
-        gamma_calls = getattr(self.gamma_llm, "call_log", []) if hasattr(self, "gamma_llm") else theta_calls
-        if theta_calls is gamma_calls:
-            llm_calls = theta_calls
-        else:
-            llm_calls = (theta_calls or []) + (gamma_calls or [])
+        llm_calls = getattr(self.llm, "call_log", [])
 
         result = {
             "dataset": self.dataset_name,

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 from tqdm import tqdm
 
 from gamma_gpt35 import LLMClient
@@ -21,8 +23,7 @@ from metrics_gpt35 import (
     extract_predicted_support_indices,
 )
 
-from dotenv import load_dotenv
-load_dotenv()
+
 
 DATASET_CONFIG = {
     "2wiki": {
@@ -207,6 +208,8 @@ def run_dataset(
     os.makedirs(log_dir, exist_ok=True)
     out_path = os.path.join(log_dir, f"theta_gamma_{dataset_name}.jsonl")
     verbose_log_path = os.path.join(log_dir, f"theta_gamma_{dataset_name}_verbose.log")
+    per_example_dir = os.path.join(log_dir, f"{dataset_name}_examples_txt")
+    os.makedirs(per_example_dir, exist_ok=True)
 
     if limit is not None and limit > 0:
         eval_data = data[:limit]
@@ -312,6 +315,19 @@ def run_dataset(
                 vlog.write("\n".join(vlog_lines) + "\n")
                 vlog.flush()
                 current_processed += 1
+                # Write per-example text log for skipped cases
+                per_path = os.path.join(per_example_dir, f"example_{idx:05d}.txt")
+                per_lines = [
+                    f"==== Example {idx} (SKIPPED) ====",
+                    f"Dataset: {dataset_name}",
+                    f"Question: {question_txt}",
+                    f"Skip stage: {skip_stage}",
+                    f"Skip reason: {result.get('skip_reason')}",
+                    f"Skip error status: {result.get('skip_error_status')}",
+                    f"Skip error body: {resp_body}",
+                ]
+                with open(per_path, "w", encoding="utf-8") as pf:
+                    pf.write("\n".join(per_lines) + "\n")
                 if current_processed > 0:
                     answered_count = current_processed - skipped_count
                     if answered_count > 0:
@@ -417,6 +433,77 @@ def run_dataset(
             log_lines.append("")  # separator
             vlog.write("\n".join(log_lines))
             vlog.flush()
+
+            # Per-example full text IO log (non-JSON)
+            per_lines = []
+            per_lines.append(f"==== Example {idx} ====")
+            per_lines.append(f"Dataset: {dataset_name}")
+            per_lines.append(f"Question: {result.get('question')}")
+            per_lines.append(
+                f"LLMs: theta={theta_model_id} ({theta_model_short}), gamma/acc={gamma_model_id} ({gamma_model_short})"
+            )
+            schema_summary = trace.get("question_schema_summary", "")
+            if schema_summary:
+                per_lines.append("-- Question schema summary --")
+                per_lines.extend(schema_summary.splitlines())
+            planned = trace.get("planned_subquestions") or []
+            executed = trace.get("executed_subquestions") or []
+            if planned:
+                per_lines.append("-- Planned subquestions --")
+                for i, sub in enumerate(planned, 1):
+                    per_lines.append(f"{i}. {sub}")
+            if executed:
+                per_lines.append("-- Executed subquestions --")
+                for i, sub in enumerate(executed, 1):
+                    per_lines.append(f"{i}. {sub}")
+            per_lines.append("-- Gamma steps --")
+            per_lines.extend(log_lines[3:])  # reuse gamma/theta/acc lines already built
+            per_lines.append("-- Metrics --")
+            per_lines.append(
+                f"answer_em={result.get('answer_em')} answer_f1={result.get('answer_f1')} "
+                f"support_em={result.get('support_em')} support_f1={result.get('support_f1')} "
+                f"support_precision={result.get('support_precision')} support_recall={result.get('support_recall')}"
+            )
+            per_lines.append(f"Gold answers: {result.get('gold_answers')}")
+            per_lines.append(f"Predicted answer: {result.get('predicted_answer')}")
+            per_lines.append(f"Theta answer: {result.get('theta_answer')}")
+            per_lines.append(f"Gold support indices: {result.get('gold_support_indices')}")
+            per_lines.append(f"Predicted support indices: {result.get('predicted_support_indices')}")
+            comparator = trace.get("symbolic_comparator") or {}
+            if comparator:
+                per_lines.append("-- Symbolic comparator --")
+                per_lines.append(
+                    f"is_comparative={comparator.get('is_comparative')} keywords={comparator.get('keywords')} "
+                    f"summary={comparator.get('summary')}"
+                )
+            acc_section = trace.get("acc_result") or {}
+            if acc_section:
+                per_lines.append("-- ACC result --")
+                per_lines.append(
+                    f"action={acc_section.get('action')} final_answer={acc_section.get('final_answer', acc_section.get('candidate_answer'))} "
+                    f"explanation={acc_section.get('explanation')} flags={acc_section.get('flags')} candidates={acc_section.get('candidates')}"
+                )
+            llm_calls = result.get("llm_calls") or []
+            if llm_calls:
+                per_lines.append("-- LLM calls --")
+                for i, call in enumerate(llm_calls, 1):
+                    meta = call.get("meta") or {}
+                    req = call.get("request") or {}
+                    per_lines.append(
+                        f"  Call {i}: agent={meta.get('agent')} kind={meta.get('kind')} dataset={meta.get('dataset')} type={call.get('type')}"
+                    )
+                    if req:
+                        per_lines.append(f"    request: {req}")
+                    resp_text = call.get("response_text")
+                    if resp_text:
+                        per_lines.append(f"    response_text: {resp_text}")
+                    raw_resp = call.get("raw_response")
+                    if raw_resp and not resp_text:
+                        per_lines.append(f"    raw_response: {raw_resp}")
+
+            per_path = os.path.join(per_example_dir, f"example_{idx:05d}.txt")
+            with open(per_path, "w", encoding="utf-8") as pf:
+                pf.write("\n".join(per_lines) + "\n")
 
             # Update processed count
             current_processed += 1

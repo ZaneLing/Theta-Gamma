@@ -1,35 +1,13 @@
-# gamma.py
+# gamma_gpt35.py
 # Gamma agent + LLM utilities
 
 import os
 import json
 import re
 import time
-import requests
-from datetime import datetime
 from typing import Any, Dict, List, Optional
-from pathlib import Path
-import yaml
 
-
-def load_dotenv(path: str = ".env") -> None:
-    """
-    Minimal .env loader that reads KEY=VALUE per line.
-    """
-    if not os.path.exists(path):
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                os.environ.setdefault(key, value)
-    except Exception:
-        pass
+import requests
 
 
 def extract_json_from_text(text: str) -> Dict[str, Any]:
@@ -39,6 +17,7 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
     - Strip <think>/<analysis> reasoning blocks and retry.
     - If it still fails, pull the last {...} substring in the text.
     """
+
     def _strip_reasoning_blocks(raw: str) -> str:
         cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
         cleaned = re.sub(r"<analysis>.*?</analysis>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
@@ -70,6 +49,7 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
             return obj
     raise ValueError(f"Cannot parse JSON from LLM output: {text[:200]}...")
 
+
 class LLMClient:
     """
     Thin wrapper around the OpenRouter / OpenAI chat API.
@@ -88,7 +68,6 @@ class LLMClient:
         api_url: Optional[str] = None,
         fallback_model_name: Optional[str] = None,
     ):
-        load_dotenv()
         self.api_url = api_url or os.getenv("API_URL", "https://openrouter.ai/api/v1/chat/completions")
         # Default to OpenRouter GPT-3.5 Turbo identifier
         requested_model = model_name or os.getenv("MODEL_NAME", "openai/gpt-3.5-turbo")
@@ -177,28 +156,57 @@ class GammaAgent:
     Gamma agent: search within facts and answer subquestions.
     """
 
+    PROMPTS: Dict[str, str] = {
+        "gamma_answer": """
+You are the gamma agent in a dual-agent multi-hop QA system.
+
+Your role:
+- Given a SUBQUESTION and a list of NUMBERED FACTS, pick the relevant facts.
+- If the facts are sufficient, extract a SHORT ANSWER phrase (a few words).
+- If the facts are NOT sufficient, you must say found = false and answer = null.
+
+CRITICAL OUTPUT REQUIREMENTS:
+- You MUST respond with a SINGLE valid JSON object.
+- Do NOT write any explanation outside JSON.
+- JSON keys:
+  - "found": a boolean
+  - "selected_fact_indices": array of integers (indices of used facts, possibly empty)
+  - "answer": a string or null
+  - "reasoning": a short one-sentence explanation in English
+
+Example of valid output:
+{{
+  "found": true,
+  "selected_fact_indices": [1, 3],
+  "answer": "Thomas Jefferson",
+  "reasoning": "Facts [1] and [3] show his role and birth state."
+}}
+
+Now process the input.
+
+SUBQUESTION:
+{subquestion}
+
+FACTS:
+{facts_block}
+
+Respond with JSON ONLY:
+""".strip(),
+    }
+
     def __init__(self, dataset_name: str, llm_client: LLMClient):
         assert dataset_name in {"2wiki", "hotpotqa", "musique"}
         self.dataset_name = dataset_name
         self.llm = llm_client
         self._prompt_cache: Dict[str, str] = {}
 
-    # ---------- Prompt loading ----------
-
-    def _load_prompts(self) -> Dict[str, str]:
-        if self._prompt_cache:
-            return self._prompt_cache
-        prompt_path = Path(__file__).resolve().parent / "prompts" / "gamma_prompts.yaml"
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        self._prompt_cache = {str(k): str(v) for k, v in data.items()}
-        return self._prompt_cache
-
     def _get_prompt(self, name: str) -> str:
-        prompts = self._load_prompts()
-        if name not in prompts:
+        if name in self._prompt_cache:
+            return self._prompt_cache[name]
+        if name not in self.PROMPTS:
             raise KeyError(f"Prompt '{name}' not found")
-        return prompts[name]
+        self._prompt_cache[name] = self.PROMPTS[name]
+        return self._prompt_cache[name]
 
     # ---------- Build facts for different datasets ----------
 
@@ -246,32 +254,34 @@ class GammaAgent:
             return self._build_facts_musique(example)
         raise ValueError(f"Unknown dataset: {self.dataset_name}")
 
-    # ---------- Retrieve + answer a single subquestion ----------
+    # ---------- 内部工具：构造 facts_block 并调用一次 LLM ----------
 
-    def answer_subquestion(
+    def _build_facts_block(self, facts: List[Dict[str, Any]]) -> str:
+        fact_lines: List[str] = []
+        for f in facts:
+            fact_lines.append(
+                f"[{f['idx']}] Title: {f['title']}\nText: {f['text']}"
+            )
+        return "\n\n".join(fact_lines)
+
+    def _run_gamma_once(
         self,
-        example: Dict[str, Any],
         subquestion: str,
+        candidate_facts: List[Dict[str, Any]],
         call_id: str,
+        all_facts: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        facts = self.build_facts(example)
-        if not facts:
+        if not candidate_facts:
             return {
                 "found": False,
                 "answer": None,
                 "selected_fact_indices": [],
                 "selected_fact_texts": [],
-                "reasoning": "No facts available",
+                "reasoning": "No facts available for this subquestion",
                 "raw_json": {},
             }
 
-        fact_lines = []
-        for f in facts:
-            fact_lines.append(
-                f"[{f['idx']}] Title: {f['title']}\nText: {f['text']}"
-            )
-        facts_block = "\n\n".join(fact_lines)
-
+        facts_block = self._build_facts_block(candidate_facts)
         prompt = self._get_prompt("gamma_answer").format(
             subquestion=subquestion,
             facts_block=facts_block,
@@ -316,7 +326,7 @@ class GammaAgent:
 
         selected_fact_texts: List[str] = []
         idx_set = set()
-        fact_map = {f["idx"]: f for f in facts}
+        fact_map = {f["idx"]: f for f in all_facts}
         for idx in idxs:
             if idx in fact_map and idx not in idx_set:
                 f = fact_map[idx]
@@ -337,3 +347,138 @@ class GammaAgent:
             "reasoning": reasoning,
             "raw_json": obj,
         }
+
+    # ---------- MusiQue 专用：从 schema + 子问题中抽锚点实体 ----------
+
+    def _extract_anchors_from_schema(
+        self,
+        schema: Optional[Dict[str, Any]],
+        subquestion: str,
+    ) -> List[str]:
+        if not schema:
+            return []
+        sq_lower = (subquestion or "").lower()
+        anchors: List[str] = []
+        for e in schema.get("entities", []) or []:
+            name = (e.get("name") or "").strip()
+            if not name:
+                continue
+            # 只把真的在子问题里出现的实体，当做当前子问题的锚点
+            if name.lower() in sq_lower:
+                anchors.append(name)
+        return anchors
+
+    def _measure_title_relevance(self, title: str, anchors: List[str]) -> int:
+        """
+        一个简单但偏向“精确 title 匹配”的打分：
+        - 完全相等（忽略大小写）: 100
+        - 互为包含: 60
+        - token 交集 >0: 10 + 交集长度
+        这样能让 "John J. Collins" >> "John Collins" >> "Lucy John"
+        """
+        t = (title or "").lower()
+        if not t or not anchors:
+            return 0
+        tokens_t = set(re.findall(r"\w+", t))
+        score = 0
+        for a in anchors:
+            al = (a or "").lower()
+            if not al:
+                continue
+            if t == al or t.strip() == al.strip():
+                score = max(score, 100)
+                continue
+            if al in t or t in al:
+                score = max(score, 60)
+            ats = set(re.findall(r"\w+", al))
+            if tokens_t and ats:
+                inter = len(tokens_t & ats)
+                if inter > 0:
+                    score = max(score, 10 + inter)
+        return score
+
+    # ---------- Retrieve + answer a single subquestion ----------
+
+    def answer_subquestion(
+        self,
+        example: Dict[str, Any],
+        subquestion: str,
+        call_id: str,
+        schema: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        对 2wiki / hotpotqa：仍然是“全部 facts”一次性喂给 LLM。
+        对 MusiQue：
+          - 如果能从 schema + 子问题中抽到实体锚点：
+              1) 按标题相关度对所有段落 rerank，选出 top-5 作为 primary_facts。
+              2) 用 primary_facts 做第一轮 Gamma 调用。
+              3) 若未找到答案（found=False 或没选中任何 fact），
+                 再用剩余段落做第二轮 Gamma 调用。
+          - 如果没有锚点，则退化为“全量 facts 一次性调用”。
+        """
+        facts = self.build_facts(example)
+        if not facts:
+            return {
+                "found": False,
+                "answer": None,
+                "selected_fact_indices": [],
+                "selected_fact_texts": [],
+                "reasoning": "No facts available",
+                "raw_json": {},
+            }
+
+        # MusiQue: 标题优先 + 两阶段检索
+        if self.dataset_name == "musique" and schema is not None:
+            anchors = self._extract_anchors_from_schema(schema, subquestion)
+            if anchors:
+                # 1) 按标题相关度打分
+                scored: List[Dict[str, Any]] = []
+                for f in facts:
+                    s = self._measure_title_relevance(f.get("title", ""), anchors)
+                    scored.append({"score": s, "fact": f})
+
+                scored.sort(key=lambda x: x["score"], reverse=True)
+
+                # 只保留有分数的 top-5；若全部 0 分，就按原顺序取前 5
+                primary_facts: List[Dict[str, Any]] = [
+                    item["fact"] for item in scored if item["score"] > 0
+                ][:5]
+                if not primary_facts:
+                    primary_facts = [item["fact"] for item in scored[:5]]
+
+                primary_idx_set = {f["idx"] for f in primary_facts}
+
+                # 2) 第一轮：只用 top-5 段落
+                first = self._run_gamma_once(
+                    subquestion=subquestion,
+                    candidate_facts=primary_facts,
+                    call_id=f"{call_id}_p1",
+                    all_facts=facts,
+                )
+                first["retrieval_pass"] = "primary"
+                first["retrieval_anchors"] = anchors
+                first["retrieval_primary_indices"] = sorted(primary_idx_set)
+
+                if (not first.get("found")) or (not first.get("selected_fact_indices")):
+                    # 3) 如果没找到，再用剩余段落做第二轮
+                    fallback_facts = [f for f in facts if f["idx"] not in primary_idx_set]
+                    if fallback_facts:
+                        second = self._run_gamma_once(
+                            subquestion=subquestion,
+                            candidate_facts=fallback_facts,
+                            call_id=f"{call_id}_p2",
+                            all_facts=facts,
+                        )
+                        second["retrieval_pass"] = "fallback"
+                        second["retrieval_anchors"] = anchors
+                        second["retrieval_primary_indices"] = sorted(primary_idx_set)
+                        return second
+                return first
+
+        # 默认路径：直接把所有 facts 一次性喂给 LLM（2wiki/hotpotqa 或没有锚点的 MusiQue）
+        return self._run_gamma_once(
+            subquestion=subquestion,
+            candidate_facts=facts,
+            call_id=call_id,
+            all_facts=facts,
+        )

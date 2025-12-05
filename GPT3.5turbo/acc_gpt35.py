@@ -14,8 +14,6 @@
 # 4. All decisions and intermediate info are written into acc_result for later analysis.
 
 from typing import Any, Dict, List, Optional
-from pathlib import Path
-import yaml
 
 from gamma_gpt35 import LLMClient, extract_json_from_text
 
@@ -29,25 +27,94 @@ BOOL_YES = "yes"
 BOOL_NO = "no"
 BOOL_UNKNOWN = "unknown"
 
-_PROMPT_CACHE: Dict[str, str] = {}
+PROMPTS: Dict[str, str] = {
+    "acc_check": """
+You are an ACC-like self-checking module in a multi-hop QA system.
 
+Your role:
+- You are NOT a full problem solver.
+- You act as a JUDGE + LIGHT EDITOR over the Theta agent's INITIAL_ANSWER.
+- You have a very LIMITED ACTION SPACE.
 
-def _load_prompts() -> Dict[str, str]:
-    global _PROMPT_CACHE
-    if _PROMPT_CACHE:
-        return _PROMPT_CACHE
-    prompt_path = Path(__file__).resolve().parent / "prompts" / "acc_prompts.yaml"
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    _PROMPT_CACHE = {str(k): str(v) for k, v in data.items()}
-    return _PROMPT_CACHE
+You receive:
+- ORIGINAL QUESTION
+- INITIAL_ANSWER from Theta
+- STEPWISE EVIDENCE from Gamma
+- A CANDIDATE_ANSWER_SET that you MUST respect.
+- For each Gamma step, you may also see a line like:
+    "bridge_ok: <true/false> anchors=[...] matched_anchors=[...]"
+  These come from a BridgeManager that checks whether the selected facts actually
+  mention the anchor entities from the question/schema/previous steps.
+- If bridge_ok=false, you should treat that step as UNRELIABLE EVIDENCE.
+- Do NOT use such steps to aggressively flip or override the INITIAL_ANSWER.
+- Prefer KEEP or ANSWER_UNKNOWN when evidence is weak or bridge_ok is mostly false.
 
+Your allowed actions (ACTION):
+1. "KEEP":
+    - Keep INITIAL_ANSWER as the final answer.
+2. "FLIP_BOOL":
+    - Only for YES/NO type questions.
+    - Flip "yes" to "no" or "no" to "yes".
+    - If INITIAL_ANSWER is not clearly yes/no, do NOT use this.
+3. "CHOOSE_FROM_CANDIDATES":
+    - Choose a different answer from the candidate set.
+    - You MUST NOT invent any answer outside the candidate set.
+4. "ANSWER_UNKNOWN":
+    - Use this only if the evidence is clearly insufficient to decide.
+    - In that case, final_answer should be "unknown" (or equivalent).
 
-def get_prompt(name: str) -> str:
-    prompts = _load_prompts()
-    if name not in prompts:
-        raise KeyError(f"Prompt '{name}' not found")
-    return prompts[name]
+Guidelines:
+- Prefer ACTION="KEEP" unless you see a CLEAR and STRONG conflict between INITIAL_ANSWER and the reliable evidence.
+- For YES/NO questions, normalised answers are:
+    - "yes" for yes/true,
+    - "no" for no/false,
+    - "unknown" for unknown / cannot be determined.
+- For non-YES/NO questions, you must choose within the provided candidate set.
+
+You MUST answer ONLY the ORIGINAL QUESTION. Do NOT change its meaning.
+Do NOT output intermediate entities if the question asks for a film, person, country, etc.
+For example, if the question asks "Which film ...", the final answer must be a FILM TITLE, not a director name.
+
+You must output a SINGLE JSON object with fields:
+{
+  "action": "KEEP" | "FLIP_BOOL" | "CHOOSE_FROM_CANDIDATES" | "ANSWER_UNKNOWN",
+  "candidate_answer": "string or empty",
+  "explanation": "short explanation in English",
+  "flags": {
+    "entity_mismatch": true/false,
+    "logic_inconsistency": true/false,
+    "insufficient_evidence": true/false
+  }
+}
+
+IMPORTANT CONSTRAINTS:
+- If action="KEEP":
+    - You MUST set candidate_answer to an empty string or to INITIAL_ANSWER.
+- If action="FLIP_BOOL":
+    - This only makes sense for YES/NO questions.
+    - You should flip yes<->no based on the evidence.
+- If action="CHOOSE_FROM_CANDIDATES":
+    - candidate_answer MUST be exactly one of the provided candidates.
+- If action="ANSWER_UNKNOWN":
+    - candidate_answer SHOULD be "unknown" (or empty).
+- Never invent new entities or facts not suggested by the evidence.
+
+METADATA:
+- QUESTION_TYPE = {question_type}
+- CANDIDATES = {candidates}
+
+ORIGINAL QUESTION:
+{question}
+
+INITIAL_ANSWER:
+{initial_answer}
+
+GAMMA STEPWISE EVIDENCE:
+{gamma_evidence}
+
+Now respond with JSON ONLY:
+""".strip(),
+}
 
 
 class ACCAgent:
@@ -57,20 +124,6 @@ class ACCAgent:
     Main interface:
         check_answer(question, gamma_results, initial_answer) -> dict
 
-    Example return dict:
-    {
-        "action": "KEEP",
-        "final_answer": "yes",
-        "explanation": "...",
-        "flags": {
-            "entity_mismatch": False,
-            "logic_inconsistency": False,
-            "insufficient_evidence": False
-        },
-        "candidates": ["yes", "no", "unknown"],
-        "raw_llm_output": "<raw llm output text>",
-        "raw_json": {...}  # JSON parsed from the LLM
-    }
     """
 
     def __init__(self, dataset_name: str, llm_client: LLMClient):
@@ -84,8 +137,7 @@ class ACCAgent:
     def _format_gamma_evidence(self, gamma_results: List[Dict[str, Any]]) -> str:
         """
         Format theta-gamma step results into text for ACC.
-        这里会把 BridgeManager 的 bridge 信息也一并写进去，
-        方便 ACC 把 bridge_ok=False 的 step 当成“可疑证据”。
+        Include BridgeManager info so ACC can treat bridge_ok=False steps as suspect evidence.
         """
         lines: List[str] = []
         for i, step in enumerate(gamma_results, start=1):
@@ -98,7 +150,7 @@ class ACCAgent:
             lines.append(f"  gamma_answer: {gres.get('answer')}")
             lines.append(f"  gamma_reasoning: {gres.get('reasoning')}")
 
-            # Bridge 信息：bridge_ok / anchors / matched_anchors
+            # Bridge info: bridge_ok / anchors / matched_anchors
             if bridge:
                 lines.append(
                     f"  bridge_ok: {bridge.get('bridge_ok')} "
@@ -295,14 +347,14 @@ class ACCAgent:
 
             initial_answer_normed = initial_answer
 
-        # 2) Format Gamma evidence (包含 bridge 信息)
+        # 2) Format Gamma evidence (includes bridge info)
         evidence_block = self._format_gamma_evidence(gamma_results)
 
         # 3) Build ACC prompt (must stay within given candidates/actions)
         candidate_list_str = ", ".join(f'"{c}"' for c in candidates) if candidates else ""
         bool_or_not = "YES_NO" if is_bool_q else "GENERAL"
 
-        prompt = get_prompt("acc_self_check").format(
+        prompt = PROMPTS["acc_check"].format(
             BOOL_YES=BOOL_YES,
             BOOL_NO=BOOL_NO,
             BOOL_UNKNOWN=BOOL_UNKNOWN,
