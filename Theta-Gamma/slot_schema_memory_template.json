@@ -1,0 +1,50 @@
+{
+  "global_theta_memory": {
+    "label": "===== Global Theta Memory =====",
+    "symbol": "M_theta",
+    "global_schema": {
+      "pfc_planning": {
+        "main_question": "$Q",
+        "subquestion_list": ["$sq_1", "...", "$sq_t"],
+        "subquestion_core_entity": ["$ce_1", "...", "$ce_t"],
+        "expected_answer_type": ["$tau_1", "...", "$tau_t"]
+      }
+    },
+    "global_slots": {
+      "expected_sub_answer": ["$sa_1", "...", "$sa_t"],
+      "completion_flag": ["$ok_1", "...", "$ok_t"],
+      "failure_flag": ["$fl_1", "...", "$fl_t"]
+    }
+  },
+  "local_gamma_memory": {
+    "label": "===== Local Gamma Memory =====",
+    "symbol": "M_gamma",
+    "hop_records": [
+      {
+        "hop_index": "$t",
+        "record_index": "$i",
+        "memory": {
+          "subquestion": "$sq_t",
+          "core_entity": "$ce_t",
+          "expected_type": "$tau_t",
+          "refinement": "$rf_{i-1}",
+          "hpc_retrieval": {
+            "sub_answer": "$sa_i",
+            "predicted_type": "$hat_tau_i",
+            "evidence": "$e_i",
+            "reason": "$r_i"
+          },
+          "acc_verification": {
+            "acc_i": {
+              "check_evidence": "Check_e_i",
+              "check_predicted_type": "Check_hat_tau_i",
+              "check_reason": "Check_r_i",
+              "refinement": "$rf_i"
+            },
+            "acc_tuple": "<Check_e_i, Check_hat_tau_i, Check_r_i, rf_i>"
+          }
+        }
+      }
+    ]
+  }
+}
