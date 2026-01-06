@@ -1,6 +1,6 @@
 # THOR
 
-This package runs the Theta–Gamma dual-agent pipeline with an ACC self-check on 2Wiki / HotpotQA / MuSiQue and derived hop splits.
+This package runs the Theta–Gamma pipeline with an ACC self-check on 2Wiki / HotpotQA / MuSiQue and derived hop splits.
 
 ## Components
 - **gamma_gpt35.py** — Gamma agent; answers subquestions over provided facts using an embedded `gamma_answer` prompt.
