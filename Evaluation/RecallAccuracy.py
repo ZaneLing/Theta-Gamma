@@ -5,7 +5,7 @@ import json
 import os
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from metrics_gpt35 import extract_predicted_support_indices
+from metrics_gpt35_em import extract_predicted_support_indices
 
 
 def _iter_jsonl(path: str) -> Iterable[Dict]:

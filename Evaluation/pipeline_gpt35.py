@@ -9,15 +9,15 @@ from typing import Any, Dict, List, Tuple, Set
 from tqdm import tqdm
 
 from gamma_gpt35 import LLMClient
-from theta_gpt35 import ThetaAgent
-from metrics_gpt35 import (
+from theta_gpt35 import PFC
+from metrics_gpt35_em import (
     get_gold_answers,
     get_gold_support_indices,
     answer_em,
-    answer_f1,
     compute_support_metrics,
     extract_predicted_support_indices,
 )
+from metrics_gpt35_f1 import answer_f1
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -175,11 +175,11 @@ def run_dataset(
         for idx, ex in pbar:
             call_log: List[Dict[str, Any]] = []
             llm_client = LLMClient(call_log=call_log)
-            theta = ThetaAgent(dataset_name=dataset_name, llm_client=llm_client)
+            pfc = PFC(dataset_name=dataset_name, llm_client=llm_client)
 
-            result = theta.solve_one(ex, example_index=idx)
+            result = pfc.solve_one(ex, example_index=idx)
 
-            # Compute metrics outside Theta
+            # Compute metrics outside PFC
             gold_answers = get_gold_answers(ex)
             pred_answer = result.get("predicted_answer", "")
             ans_em_val = answer_em(dataset_name, pred_answer, gold_answers)
@@ -213,7 +213,7 @@ def run_dataset(
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
             fout.flush()  # flush immediately for checkpoint safety
 
-            # ---- Human-readable log: per-question view question / theta->gamma / gamma->theta / final decision ----
+            # ---- Human-readable log: per-question view question / pfc->hpc / hpc->pfc / final decision ----
             trace = result.get("theta_gamma_trace", {})
             gamma_steps = trace.get("gamma_results", [])
             final = trace.get("theta_final", {})
@@ -234,10 +234,10 @@ def run_dataset(
                 refined = step.get("refined_subquestion") or planned
                 gres = step.get("gamma_result", {}) or {}
                 log_lines.append(
-                    f"[Theta -> Gamma] step {step.get('step_index')}: {refined} (planned: {planned})"
+                    f"[PFC -> HPC] step {step.get('step_index')}: {refined} (planned: {planned})"
                 )
                 log_lines.append(
-                    f"[Gamma -> Theta] found={gres.get('found')} answer={gres.get('answer')} "
+                    f"[HPC -> PFC] found={gres.get('found')} answer={gres.get('answer')} "
                     f"reason={gres.get('reasoning')} used_facts={gres.get('selected_fact_indices')}"
                 )
             # Question schema / comparator hints (if present)
@@ -247,9 +247,9 @@ def run_dataset(
                     f"keywords={comparator.get('keywords')} "
                     f"summary={comparator.get('summary', '').replace(chr(10), ' / ')}"
                 )
-            # Theta's own integrated answer (before ACC)
+            # PFC's own integrated answer (before ACC)
             log_lines.append(
-                f"[Theta answer] {result.get('theta_answer')}"
+                f"[PFC answer] {result.get('theta_answer')}"
             )
             # ACC self-check
             log_lines.append(
@@ -259,7 +259,7 @@ def run_dataset(
             )
             log_lines.append(f"[ACC] explanation: {acc.get('explanation')}")
             log_lines.append(
-                f"[Theta final] answer={result.get('predicted_answer')} (gold={gold}) status={status}"
+                f"[PFC final] answer={result.get('predicted_answer')} (gold={gold}) status={status}"
             )
             log_lines.append(f"Reasoning: {final.get('reasoning', '')}")
             log_lines.append("")  # separator
@@ -296,7 +296,7 @@ def run_dataset(
 def main():
     default_data_dir = Path(__file__).resolve().parent.parent  # repo root
     parser = argparse.ArgumentParser(
-        description="Theta-Gamma dual-agent pipeline for 2Wiki / HotpotQA / MuSiQue"
+        description="PFC-HPC pipeline for 2Wiki / HotpotQA / MuSiQue"
     )
     parser.add_argument(
         "--data-dir",

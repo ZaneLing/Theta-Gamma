@@ -13,15 +13,15 @@ load_dotenv()
 from tqdm import tqdm
 
 from gamma_gpt35 import LLMClient
-from theta_gpt35 import ThetaAgent
-from metrics_gpt35 import (
+from theta_gpt35 import PFC
+from metrics_gpt35_em import (
     get_gold_answers,
     get_gold_support_indices,
     answer_em,
-    answer_f1,
     compute_support_metrics,
     extract_predicted_support_indices,
 )
+from metrics_gpt35_f1 import answer_f1
 
 
 
@@ -261,7 +261,7 @@ def run_dataset(
         vlog = open(verbose_log_path, "a", encoding="utf-8")
         for idx, ex in pbar:
             call_log: List[Dict[str, Any]] = []
-            # Gamma + ACC stay on baseline GPT-3.5; theta can optionally use a different model.
+            # HPC + ACC stay on baseline GPT-3.5; theta can optionally use a different model.
             gamma_llm = LLMClient(call_log=call_log)
             desired_theta_model = theta_model_name or os.getenv("THETA_MODEL_NAME")
             if theta_provider == "ollama":
@@ -284,13 +284,13 @@ def run_dataset(
             gamma_model_id = getattr(gamma_llm, "model_name", "unknown")
             theta_model_short = theta_model_id.split("/")[-1]
             gamma_model_short = gamma_model_id.split("/")[-1]
-            theta = ThetaAgent(
+            pfc = PFC(
                 dataset_name=theta_dataset,
                 llm_client=gamma_llm,
                 theta_llm_client=theta_llm,
             )
 
-            result = theta.solve_one(ex, example_index=idx)
+            result = pfc.solve_one(ex, example_index=idx)
 
             if result.get("skipped"):
                 skipped_count += 1
@@ -307,7 +307,7 @@ def run_dataset(
                     f"==== Example {idx} ====",
                     f"[SKIPPED {skip_stage}] {result.get('skip_reason')}",
                     f"Question: {question_txt}",
-                    f"LLMs: theta={theta_model_id} ({theta_model_short}), gamma/acc={gamma_model_id} ({gamma_model_short})",
+                    f"LLMs: pfc={theta_model_id} ({theta_model_short}), hpc/acc={gamma_model_id} ({gamma_model_short})",
                 ]
                 if resp_body:
                     vlog_lines.append(f"Response body: {resp_body}")
@@ -339,11 +339,11 @@ def run_dataset(
                         })
                 continue
 
-            # Compute metrics outside Theta
+            # Compute metrics outside PFC
             gold_answers = get_gold_answers(ex)
             pred_answer = result.get("predicted_answer", "")
             theta_answer = result.get("theta_answer", "")
-            # EM is 1 if either Theta or ACC answer matches exactly per dataset rules
+            # EM is 1 if either PFC or ACC answer matches exactly per dataset rules
             ans_em_theta = answer_em(theta_dataset, theta_answer, gold_answers)
             ans_em_acc = answer_em(theta_dataset, pred_answer, gold_answers)
             ans_em_val = 1.0 if max(ans_em_theta, ans_em_acc) >= 1.0 else 0.0
@@ -378,7 +378,7 @@ def run_dataset(
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
             fout.flush()  # flush immediately for checkpoint safety
 
-            # ---- Human-readable log: per-question view question / theta->gamma / gamma->theta / final decision ----
+            # ---- Human-readable log: per-question view question / pfc->hpc / hpc->pfc / final decision ----
             trace = result.get("theta_gamma_trace", {})
             gamma_steps = trace.get("gamma_results", [])
             final = trace.get("theta_final", {})
@@ -395,17 +395,17 @@ def run_dataset(
             log_lines.append(f"==== Example {idx} ====")
             log_lines.append(f"Question: {result.get('question')}")
             log_lines.append(
-                f"[LLMs] theta={theta_model_id} ({theta_model_short}), gamma/acc={gamma_model_id} ({gamma_model_short})"
+                f"[LLMs] pfc={theta_model_id} ({theta_model_short}), hpc/acc={gamma_model_id} ({gamma_model_short})"
             )
             for step in gamma_steps:
                 planned = step.get("subquestion", "")
                 refined = step.get("refined_subquestion") or planned
                 gres = step.get("gamma_result", {}) or {}
                 log_lines.append(
-                    f"[Theta -> Gamma | llm={gamma_model_short}] step {step.get('step_index')}: {refined} (planned: {planned})"
+                    f"[PFC -> HPC | llm={gamma_model_short}] step {step.get('step_index')}: {refined} (planned: {planned})"
                 )
                 log_lines.append(
-                    f"[Gamma -> Theta | llm={gamma_model_short}] found={gres.get('found')} answer={gres.get('answer')} "
+                    f"[HPC -> PFC | llm={gamma_model_short}] found={gres.get('found')} answer={gres.get('answer')} "
                     f"reason={gres.get('reasoning')} used_facts={gres.get('selected_fact_indices')}"
                 )
             # Question schema / comparator hints (if present)
@@ -415,9 +415,9 @@ def run_dataset(
                     f"keywords={comparator.get('keywords')} "
                     f"summary={comparator.get('summary', '').replace(chr(10), ' / ')}"
                 )
-            # Theta's own integrated answer (before ACC)
+            # PFC's own integrated answer (before ACC)
             log_lines.append(
-                f"[Theta answer | llm={theta_model_short}] {result.get('theta_answer')}"
+                f"[PFC answer | llm={theta_model_short}] {result.get('theta_answer')}"
             )
             # ACC self-check
             log_lines.append(
@@ -427,7 +427,7 @@ def run_dataset(
             )
             log_lines.append(f"[ACC] explanation: {acc.get('explanation')}")
             log_lines.append(
-                f"[Theta final] answer={result.get('predicted_answer')} (gold={gold}) status={status}"
+                f"[PFC final] answer={result.get('predicted_answer')} (gold={gold}) status={status}"
             )
             log_lines.append(f"Reasoning: {final.get('reasoning', '')}")
             log_lines.append("")  # separator
@@ -440,7 +440,7 @@ def run_dataset(
             per_lines.append(f"Dataset: {dataset_name}")
             per_lines.append(f"Question: {result.get('question')}")
             per_lines.append(
-                f"LLMs: theta={theta_model_id} ({theta_model_short}), gamma/acc={gamma_model_id} ({gamma_model_short})"
+                f"LLMs: pfc={theta_model_id} ({theta_model_short}), hpc/acc={gamma_model_id} ({gamma_model_short})"
             )
             schema_summary = trace.get("question_schema_summary", "")
             if schema_summary:
@@ -456,7 +456,7 @@ def run_dataset(
                 per_lines.append("-- Executed subquestions --")
                 for i, sub in enumerate(executed, 1):
                     per_lines.append(f"{i}. {sub}")
-            per_lines.append("-- Gamma steps --")
+            per_lines.append("-- HPC steps --")
             per_lines.extend(log_lines[3:])  # reuse gamma/theta/acc lines already built
             per_lines.append("-- Metrics --")
             per_lines.append(
@@ -466,7 +466,7 @@ def run_dataset(
             )
             per_lines.append(f"Gold answers: {result.get('gold_answers')}")
             per_lines.append(f"Predicted answer: {result.get('predicted_answer')}")
-            per_lines.append(f"Theta answer: {result.get('theta_answer')}")
+            per_lines.append(f"PFC answer: {result.get('theta_answer')}")
             per_lines.append(f"Gold support indices: {result.get('gold_support_indices')}")
             per_lines.append(f"Predicted support indices: {result.get('predicted_support_indices')}")
             comparator = trace.get("symbolic_comparator") or {}
@@ -490,7 +490,7 @@ def run_dataset(
                     meta = call.get("meta") or {}
                     req = call.get("request") or {}
                     per_lines.append(
-                        f"  Call {i}: agent={meta.get('agent')} kind={meta.get('kind')} dataset={meta.get('dataset')} type={call.get('type')}"
+                        f"  Call {i}: rhythm={meta.get('rhythm')} kind={meta.get('kind')} dataset={meta.get('dataset')} type={call.get('type')}"
                     )
                     if req:
                         per_lines.append(f"    request: {req}")
@@ -541,7 +541,7 @@ def run_dataset(
 def main():
     default_data_dir = Path(__file__).resolve().parent.parent  # repo root
     parser = argparse.ArgumentParser(
-        description="Theta-Gamma dual-agent pipeline for 2Wiki / HotpotQA / MuSiQue"
+        description="PFC-HPC pipeline for 2Wiki / HotpotQA / MuSiQue"
     )
     parser.add_argument(
         "--data-dir",
@@ -572,21 +572,21 @@ def main():
         "--theta-model",
         type=str,
         default="gpt-o3",
-        help="Model identifier for theta (OpenRouter style). "
-             "Gamma/ACC stay on GPT-3.5-turbo. Example: gpt-o3 (alias for openai/o3-mini)",
+        help="Model identifier for PFC (OpenRouter style). "
+             "HPC/ACC stay on GPT-3.5-turbo. Example: gpt-o3 (alias for openai/o3-mini)",
     )
     parser.add_argument(
         "--theta-provider",
         type=str,
         choices=["openrouter", "ollama"],
         default="openrouter",
-        help="Theta LLM backend: openrouter (default) or ollama (for local/remote hosts).",
+        help="PFC LLM backend: openrouter (default) or ollama (for local/remote hosts).",
     )
     parser.add_argument(
         "--theta-ollama-url",
         type=str,
         default=os.getenv("THETA_OLLAMA_URL"),
-        help="Ollama /api/generate endpoint for theta (e.g., http://172.16.120.14:11434/api/generate).",
+        help="Ollama /api/generate endpoint for PFC (e.g., http://172.16.120.14:11434/api/generate).",
     )
 
     args = parser.parse_args()

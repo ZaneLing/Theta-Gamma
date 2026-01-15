@@ -1,15 +1,17 @@
 # theta_gpt35.py
-# Theta agent: orchestrates Gamma calls, applies ACC self-check,
+# PFC: orchestrates HPC calls, applies ACC self-check,
 # question schema + slot graph, and returns trace.
 
 from typing import Any, Dict, List, Optional
 import re
 import json
+from pathlib import Path
+import os
 from requests.exceptions import HTTPError, SSLError, ConnectionError, Timeout
 
-from gamma_gpt35 import LLMClient, GammaAgent, extract_json_from_text
-from acc_gpt35 import ACCAgent
-
+from gamma_gpt35 import LLMClient, HPC, ACC, extract_json_from_text
+from dotenv import load_dotenv
+load_dotenv()
 
 class BridgeManager:
     """
@@ -17,8 +19,8 @@ class BridgeManager:
 
     Goals:
     - Use entities from the question schema plus explicit entity answers from earlier
-      Gamma steps as anchors for each subquestion.
-    - Check whether Gamma-selected facts actually mention these anchors.
+      HPC steps as anchors for each subquestion.
+    - Check whether HPC-selected facts actually mention these anchors.
     - If a subquestion clearly depends on anchors but the selected facts do not mention
       them, treat the bridge as unreliable: set bridge_ok=False and found=False (gating).
 
@@ -40,7 +42,7 @@ class BridgeManager:
         # Extract explicit entity names (and aliases if present) from the schema
         self.schema_anchor_map: Dict[str, str] = self._extract_schema_anchors(schema)
         self.schema_entities: List[str] = list(self.schema_anchor_map.values())
-        # Entity-style answers from previous Gamma steps
+        # Entity-style answers from previous HPC steps
         self.prev_answers: List[str] = []
         # Bridge metadata per step
         self.steps: List[Dict[str, Any]] = []
@@ -96,7 +98,7 @@ class BridgeManager:
         gamma_result: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Run after each Gamma step:
+        Run after each HPC step:
         - extract anchors from refined_subq
         - check whether selected_fact_texts mention these anchors
         - if anchors exist but none are matched:
@@ -121,7 +123,7 @@ class BridgeManager:
                     # Clear anchors exist but selected facts never mention them: gate this step
                     bridge_ok = False
                     bridge_reason = (
-                        "Gamma selected facts do not mention any anchor entities from "
+                        "HPC selected facts do not mention any anchor entities from "
                         "schema/previous answers."
                     )
                     gamma_result["found"] = False
@@ -135,7 +137,7 @@ class BridgeManager:
                 # No answer found and the subquestion has anchors -> bridge broken here
                 bridge_ok = False
                 bridge_reason = (
-                    "Gamma could not find an answer for a subquestion that depends on "
+                    "HPC could not find an answer for a subquestion that depends on "
                     "anchor entities."
                 )
         else:
@@ -196,9 +198,9 @@ class BridgeManager:
         }
 
 
-class ThetaAgent:
+class PFC:
     """
-    Theta agent:
+    PFC:
     - Question schema analysis (task type, answer role, entities)
     - Plan subquestions (theta)
     - Dispatch gamma as needed
@@ -216,13 +218,16 @@ class ThetaAgent:
     ):
         assert dataset_name in {"2wiki", "hotpotqa", "musique"}
         self.dataset_name = dataset_name
-        # Gamma / ACC stay on the baseline llm_client; theta can optionally use
+        # HPC / ACC stay on the baseline llm_client; theta can optionally use
         # a separate client (e.g., Ollama) for planning/answering.
         self.gamma_llm = llm_client
         self.theta_llm = theta_llm_client or llm_client
-        self.acc = ACCAgent(dataset_name=dataset_name, llm_client=self.gamma_llm)
+        self._apply_openrouter_config(self.gamma_llm)
+        if self.theta_llm is not self.gamma_llm:
+            self._apply_openrouter_config(self.theta_llm)
+        self.acc = ACC(dataset_name=dataset_name, llm_client=self.gamma_llm)
         self.llm = self.theta_llm
-        self.gamma = GammaAgent(dataset_name=dataset_name, llm_client=self.gamma_llm)
+        self.hpc = HPC(dataset_name=dataset_name, llm_client=self.gamma_llm)
 
         # BridgeManager class (kept swappable for future implementations)
         self.bridge_manager_cls = BridgeManager
@@ -234,6 +239,31 @@ class ThetaAgent:
         # Working memory cache (per question)
         self._wm_question: Optional[str] = None
         self._working_memory: Optional[Dict[str, Any]] = None
+
+        # Global theta memory (per question)
+        self._global_theta_memory: Optional[Dict[str, Any]] = None
+
+    def _apply_openrouter_config(self, llm_client: Any) -> None:
+        """
+        Apply OPENROUTER_* environment settings to LLMClient instances.
+        """
+        if not isinstance(llm_client, LLMClient):
+            return
+        base_url = os.getenv("OPENROUTER_API_BASE_URL", "").strip()
+        if base_url:
+            base_url = base_url.rstrip("/")
+            if not base_url.endswith("/chat/completions"):
+                base_url = base_url + "/chat/completions"
+            llm_client.api_url = base_url
+
+        model = os.getenv("OPENROUTER_MODEL", "").strip()
+        if model:
+            aliases = getattr(llm_client, "MODEL_ALIASES", {})
+            llm_client.model_name = aliases.get(model, model)
+
+        api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if api_key:
+            llm_client.api_key = api_key
 
     # ---------- Question Schema Construction ----------
 
@@ -315,7 +345,7 @@ class ThetaAgent:
         - constraints / notes: task rules and other notes
         """
         prompt = f"""
-        You are a QUESTION SCHEMA ANALYZER for a multi-hop QA system (THETA-GAMMA).
+        You are a QUESTION SCHEMA ANALYZER for a multi-hop QA system (PFC-HPC).
 
         Given the ORIGINAL QUESTION, you must produce a compact schema that describes:
         - The task type (yes/no, comparison, fact lookup, count, etc.).
@@ -363,7 +393,7 @@ class ThetaAgent:
         raw_text = self.llm.generate(
             prompt,
             meta={
-                "agent": "theta",
+                "rhythm": "PFC",
                 "kind": "question_schema",
                 "dataset": self.dataset_name,
             },
@@ -525,6 +555,95 @@ class ThetaAgent:
                     mapping[key] = name
         return mapping
 
+    def _infer_core_entity(self, subq: str, schema: Dict[str, Any]) -> str:
+        """
+        Heuristic fallback: pick the first schema entity mentioned in the subquestion.
+        """
+        sq_lower = (subq or "").lower()
+        for e in schema.get("entities", []) or []:
+            name = (e.get("name") or "").strip()
+            if name and name.lower() in sq_lower:
+                return name
+        return ""
+
+    def _infer_expected_answer_type(self, subq: str) -> str:
+        """
+        Heuristic fallback: infer answer type from wh-words.
+        """
+        sq = (subq or "").strip().lower()
+        if sq.startswith("who "):
+            return "person"
+        if sq.startswith("where "):
+            return "location"
+        if sq.startswith("when "):
+            return "date"
+        if sq.startswith("how many ") or sq.startswith("how much "):
+            return "number"
+        if sq.startswith("what year "):
+            return "date"
+        if sq.startswith("which film ") or sq.startswith("which movie "):
+            return "film"
+        return "unknown"
+
+    def _build_global_theta_memory(
+        self,
+        question: str,
+        sub_items: List[Any],
+        schema: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Build global theta memory with placeholders for sub-answers and completion flags.
+        """
+        entries: List[Dict[str, Any]] = []
+        for item in sub_items:
+            if isinstance(item, dict):
+                subq = str(item.get("subquestion", "")).strip()
+                core_entity = str(item.get("core_entity", "")).strip()
+                expected_type = str(item.get("expected_answer_type", "")).strip()
+            else:
+                subq = str(item).strip()
+                core_entity = ""
+                expected_type = ""
+
+            if not subq:
+                continue
+
+            subq = self._canonicalize_with_schema(subq, schema)
+            if not core_entity:
+                core_entity = self._infer_core_entity(subq, schema)
+            core_entity = self._canonicalize_with_schema(core_entity, schema).strip()
+            if not expected_type:
+                expected_type = self._infer_expected_answer_type(subq)
+
+            entries.append(
+                {
+                    "sub_question": subq,
+                    "core_entity": core_entity,
+                    "expected_answer_type": expected_type or "unknown",
+                    "sub_answer": "",
+                    "completion_flag": 0,
+                }
+            )
+
+        return {
+            "main_question": question,
+            "sub_questions": entries,
+        }
+
+    def _write_global_theta_memory(
+        self,
+        memory: Dict[str, Any],
+        dataset_name: str,
+        example_index: int,
+    ) -> str:
+        base_dir = Path(__file__).resolve().parent.parent / "Memory" / "global_theta_memory"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{dataset_name}_{example_index:05d}.json"
+        path = base_dir / filename
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(memory, f, ensure_ascii=True, indent=2)
+        return str(path)
+
     def _canonicalize_with_schema(self, text: str, schema: Dict[str, Any]) -> str:
         """
         Normalize entity mentions in text to canonical forms from the schema.
@@ -549,70 +668,356 @@ class ThetaAgent:
             result = pattern.sub(canonical, result)
         return result
 
+    def _collect_found_answers(self, previous_steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Collect reliable answers from previous steps in order.
+        """
+        found_answers: List[Dict[str, Any]] = []
+        for step in previous_steps:
+            gres = step.get("gamma_result", {}) or {}
+            answer = gres.get("answer")
+            if gres.get("found") and isinstance(answer, str) and answer.strip():
+                found_answers.append(
+                    {
+                        "step_index": step.get("step_index"),
+                        "answer": answer.strip(),
+                        "subquestion": step.get("refined_subquestion")
+                        or step.get("subquestion")
+                        or "",
+                    }
+                )
+        return found_answers
+
+    def _latest_found_answer(self, previous_steps: List[Dict[str, Any]]) -> str:
+        """
+        Return the most recent reliable answer, or empty string.
+        """
+        for step in reversed(previous_steps):
+            gres = step.get("gamma_result", {}) or {}
+            answer = gres.get("answer")
+            if gres.get("found") and isinstance(answer, str) and answer.strip():
+                return answer.strip()
+        return ""
+
+    def _replace_placeholders_with_answer(self, subq: str, answer: str) -> str:
+        """
+        Replace ambiguous placeholders (e.g., "that director") with a concrete answer.
+        """
+        if not subq or not answer:
+            return subq
+        roles = [
+            "director", "actor", "writer", "author", "composer", "artist",
+            "person", "politician", "president", "prime minister", "king", "queen",
+            "city", "country", "state", "province", "company", "organization",
+            "team", "club", "school", "university",
+            "river", "mountain", "island",
+            "film", "movie", "book", "album", "song", "band", "work",
+            "show", "series", "episode", "season",
+        ]
+        role_pattern = "|".join(re.escape(r) for r in roles)
+        pattern = re.compile(
+            rf"\b(?:that|this|the)\s+(?:{role_pattern})\b(?!\s+of\b)",
+            flags=re.IGNORECASE,
+        )
+        return pattern.sub(answer, subq)
+
+    def _extract_comparison_candidates(
+        self,
+        schema: Dict[str, Any],
+        wm: Dict[str, Any],
+    ) -> List[str]:
+        """
+        Extract candidate entities for comparison tasks from schema or working memory.
+        """
+        candidates: List[str] = []
+        for e in schema.get("entities", []) or []:
+            name = (e.get("name") or "").strip()
+            if not name:
+                continue
+            role = (e.get("role") or "").strip().lower()
+            if "candidate" in role or "option" in role or "choice" in role:
+                candidates.append(name)
+
+        if len(candidates) < 2:
+            for e in wm.get("entities", []) or []:
+                name = (e.get("name") or "").strip()
+                if name and name not in candidates:
+                    candidates.append(name)
+                if len(candidates) >= 2:
+                    break
+
+        seen = set()
+        ordered: List[str] = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                ordered.append(c)
+        return ordered
+
+    def _type_guidance(self, schema: Dict[str, Any], wm: Dict[str, Any]) -> str:
+        """
+        Return type-specific prompt guidance for decomposition.
+        """
+        qtype = (schema.get("question_type") or "other").strip().lower()
+        if qtype == "comparison":
+            candidates = self._extract_comparison_candidates(schema, wm)
+            if candidates:
+                cand_line = "Candidates: " + ", ".join(f"'{c}'" for c in candidates[:2])
+            else:
+                cand_line = "Candidates: use the two comparison entities in WORKING_MEMORY."
+            return "\n".join(
+                [
+                    "COMPARISON RULES:",
+                    "- Ask for the target attribute of each candidate separately.",
+                    "- Add a final subquestion that compares them and yields the final choice.",
+                    "- Ensure each candidate appears at least once.",
+                    f"- {cand_line}",
+                ]
+            )
+        if qtype == "count":
+            return "\n".join(
+                [
+                    "COUNT RULES:",
+                    "- Identify the items to be counted.",
+                    "- Add a final subquestion that computes the count.",
+                ]
+            )
+        if qtype == "yes_no":
+            return "\n".join(
+                [
+                    "YES/NO RULES:",
+                    "- Ask for the supporting facts.",
+                    "- Add a final subquestion that decides yes or no.",
+                ]
+            )
+        return ""
+
+    def _looks_like_comparison(self, text: str, candidates: List[str]) -> bool:
+        """
+        Heuristic check for a comparison-style subquestion.
+        """
+        t = (text or "").lower()
+        keywords = [
+            "compare", "comparison", "which", "older", "younger", "earlier", "later",
+            "before", "after", "same", "different", "more", "less", "greater", "fewer",
+            "higher", "lower", "longer", "shorter", "bigger", "smaller",
+        ]
+        if any(k in t for k in keywords):
+            return True
+        if len(candidates) >= 2:
+            c0 = candidates[0].lower()
+            c1 = candidates[1].lower()
+            if c0 in t and c1 in t:
+                return True
+        return False
+
+    def _validate_comparison_plan(
+        self,
+        items: List[Dict[str, str]],
+        candidates: List[str],
+        min_steps: int,
+    ) -> Optional[str]:
+        """
+        Return an issue string if the comparison plan is incomplete, else None.
+        """
+        subqs = [
+            (item.get("subquestion") or "").strip()
+            for item in items
+            if isinstance(item, dict)
+        ]
+        if len(subqs) < max(min_steps, 3):
+            return "comparison tasks require at least 3 subquestions"
+
+        if len(candidates) >= 2:
+            missing = []
+            for c in candidates[:2]:
+                if not any(c.lower() in (s or "").lower() for s in subqs):
+                    missing.append(c)
+            if missing:
+                return "missing candidate subquestion(s) for: " + ", ".join(missing)
+
+        if subqs:
+            last = subqs[-1]
+            if not self._looks_like_comparison(last, candidates):
+                return "final subquestion does not look like a comparison step"
+
+        return None
+
+    def _sanitize_subquestion_items(
+        self,
+        items: List[Any],
+        schema: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        """
+        Normalize subquestion items into dicts, canonicalize entity mentions,
+        and drop empty or duplicate subquestions.
+        """
+        sanitized: List[Dict[str, str]] = []
+        seen: set = set()
+        for item in items:
+            if isinstance(item, dict):
+                subq = str(item.get("subquestion", "")).strip()
+                core_entity = str(item.get("core_entity", "")).strip()
+                expected_type = str(item.get("expected_answer_type", "")).strip()
+            else:
+                subq = str(item).strip()
+                core_entity = ""
+                expected_type = ""
+
+            if not subq:
+                continue
+
+            subq = self._canonicalize_with_schema(subq, schema)
+            key = subq.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            sanitized.append(
+                {
+                    "subquestion": subq,
+                    "core_entity": core_entity,
+                    "expected_answer_type": expected_type,
+                }
+            )
+        return sanitized
+
+    def _subquestion_repair_prompt(
+        self,
+        question: str,
+        schema: Dict[str, Any],
+        wm: Dict[str, Any],
+        items: List[Dict[str, str]],
+        max_steps: int,
+        min_steps: int,
+        issue_hint: str,
+    ) -> str:
+        wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
+        items_json = json.dumps({"subquestions": items}, ensure_ascii=False, indent=2)
+        type_guidance = self._type_guidance(schema, wm)
+        type_block = f"\n{type_guidance}\n" if type_guidance else ""
+
+        return f"""
+You are PFC.
+
+The current decomposition is invalid or incomplete: {issue_hint}
+
+Rewrite into {min_steps} to {max_steps} ordered, step-by-step subquestions.
+Each subquestion should ask for one missing fact.
+
+Rules:
+- Use exact entity names from WORKING_MEMORY.entities when referring to known entities.
+- If a step depends on a previous answer, you may use a short placeholder (e.g., "that person").
+- The last subquestion should enable the final answer.
+{type_block}
+
+CANDIDATE_SUBQUESTIONS (invalid):
+{items_json}
+
+QUESTION_SCHEMA_JSON:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+WORKING_MEMORY (authoritative, do NOT modify):
+{wm_json}
+
+ORIGINAL QUESTION:
+{question}
+
+Return JSON ONLY with:
+- "subquestions": array of {min_steps} to {max_steps} objects:
+  - "subquestion": string
+  - "core_entity": string (use WORKING_MEMORY.entities[*].name when applicable)
+  - "expected_answer_type": string (e.g., person, location, date, number, film, organization)
+
+Respond with JSON ONLY:
+""".strip()
+
+    def _split_single_subquestion_prompt(
+        self,
+        question: str,
+        schema: Dict[str, Any],
+        wm: Dict[str, Any],
+        subquestion: str,
+        max_steps: int,
+        min_steps: int,
+    ) -> str:
+        wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
+        type_guidance = self._type_guidance(schema, wm)
+        type_block = f"\n{type_guidance}\n" if type_guidance else ""
+
+        return f"""
+You are PFC.
+
+Split the SINGLE_SUBQUESTION into {min_steps} to {max_steps} ordered, step-by-step subquestions.
+Each subquestion should ask for one missing fact.
+
+Rules:
+- Use exact entity names from WORKING_MEMORY.entities when referring to known entities.
+- If a step depends on a previous answer, you may use a short placeholder (e.g., "that person").
+- The last subquestion should enable the final answer.
+{type_block}
+
+SINGLE_SUBQUESTION:
+{subquestion}
+
+QUESTION_SCHEMA_JSON:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+WORKING_MEMORY (authoritative, do NOT modify):
+{wm_json}
+
+ORIGINAL QUESTION:
+{question}
+
+Return JSON ONLY with:
+- "subquestions": array of {min_steps} to {max_steps} objects:
+  - "subquestion": string
+  - "core_entity": string (use WORKING_MEMORY.entities[*].name when applicable)
+  - "expected_answer_type": string (e.g., person, location, date, number, film, organization)
+
+Respond with JSON ONLY:
+""".strip()
+
     # ---------- Stage 1: theta decomposes the question ----------
 
     def plan_subquestions(self, question: str, max_steps: int = 4) -> List[str]:
         # Ensure schema & working memory are prepared
         schema = self._ensure_schema(question)
         wm = self._ensure_working_memory(question)
-        schema_summary = self._schema_summary(schema)
         wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
+        question_type = (schema.get("question_type") or "other").strip().lower()
+        min_steps = 2 if max_steps >= 2 else max_steps
+        if question_type == "comparison":
+            min_steps = max(min_steps, 3)
+        type_guidance = self._type_guidance(schema, wm)
+        type_block = f"\n{type_guidance}\n" if type_guidance else ""
 
         prompt = f"""
-You are the THETA agent in a dual-agent multi-hop reasoning system.
+You are PFC.
 
-You have two inputs:
-1) QUESTION_SCHEMA_JSON: a compact analysis of the question.
-2) WORKING_MEMORY: a variable-style memory that contains canonical entities from the question.
+Decompose the ORIGINAL QUESTION into {min_steps} to {max_steps} ordered, step-by-step subquestions.
+Each subquestion should ask for one missing fact. Do NOT answer the question.
 
-WORKING_MEMORY:
-- You MUST treat WORKING_MEMORY.entities as the authoritative list of entities.
-- Each entity has an id (E1, E2, ...) and a canonical "name", "type", "role".
-- When you write SUBQUESTIONS, you MUST NOT invent or paraphrase entity names.
-  Instead, you MUST copy the exact "name" field from WORKING_MEMORY.entities[*].
-  For example, if WORKING_MEMORY.entities has:
-    {{"id": "E1", "name": "The Game", "type": "film", "role": "subject"}}
-  then in your subquestions you MUST use "The Game" exactly (same casing and spacing),
-  NOT "the game", NOT "that game", NOT any paraphrase.
+Rules:
+- Use exact entity names from WORKING_MEMORY.entities when referring to known entities.
+- If a step depends on a previous answer, you may use a short placeholder (e.g., "that person").
+- The last subquestion should enable the final answer.
+{type_block}
 
-TASK:
-Decompose the ORIGINAL QUESTION into 2 to {max_steps} ordered SUBQUESTIONS.
-
-Guidelines:
-- Each subquestion should be a simple fact-based question.
-- The sequence of subquestions should follow the schema:
-  - Respect the question_type and constraints.
-  - Ensure that the LAST subquestion directly prepares the information needed
-    to produce the final answer in the required ANSWER_FORM.
-
-Do NOT answer the question here; only plan subquestions.
-
-QUESTION_SCHEMA_JSON (for reference, do NOT rewrite it):
+QUESTION_SCHEMA_JSON:
 {json.dumps(schema, ensure_ascii=False, indent=2)}
-
-QUESTION_SCHEMA_SUMMARY (for human readability):
-{schema_summary}
 
 WORKING_MEMORY (authoritative, do NOT modify):
 {wm_json}
 
-CRITICAL OUTPUT:
-- Respond with a SINGLE JSON object.
-- JSON keys:
-  - "subquestions": array of 2 to {max_steps} strings.
-
-Example:
-{{
-  "subquestions": [
-    "Who directed the film 'Move (1970 film)'?",
-    "What country is that director from?",
-    "Who directed 'Méditerranée (1963 film)'?",
-    "What country is that director from?"
-  ]
-}}
-
 ORIGINAL QUESTION:
 {question}
+
+Return JSON ONLY with:
+- "subquestions": array of {min_steps} to {max_steps} objects:
+  - "subquestion": string
+  - "core_entity": string (use WORKING_MEMORY.entities[*].name when applicable)
+  - "expected_answer_type": string (e.g., person, location, date, number, film, organization)
 
 Respond with JSON ONLY:
 """.strip()
@@ -620,7 +1025,7 @@ Respond with JSON ONLY:
         raw_text = self.llm.generate(
             prompt,
             meta={
-                "agent": "theta",
+                "rhythm": "PFC",
                 "kind": "plan_subquestions",
                 "dataset": self.dataset_name,
             },
@@ -629,16 +1034,160 @@ Respond with JSON ONLY:
 
         try:
             obj = extract_json_from_text(raw_text)
-            subs = obj.get("subquestions", [])
-            subs = [str(x).strip() for x in subs if str(x).strip()]
-            if not subs:
-                subs = [question]
-            # Canonicalize entity names with the schema to avoid drift
-            subs = [self._canonicalize_with_schema(s, schema) for s in subs]
-            return subs[:max_steps]
+            items = obj.get("subquestions", [])
+            if not isinstance(items, list):
+                items = []
+
+            items = self._sanitize_subquestion_items(items, schema)
+            candidates = []
+            if question_type == "comparison":
+                candidates = self._extract_comparison_candidates(schema, wm)
+
+            # Enforce multi-subquestion planning with a repair pass if needed
+            issue_parts: List[str] = []
+            if len(items) < min_steps:
+                issue_parts.append(
+                    f"only {len(items)} subquestion(s); must be at least {min_steps}"
+                )
+            if question_type == "comparison":
+                cmp_issue = self._validate_comparison_plan(items, candidates, min_steps)
+                if cmp_issue:
+                    issue_parts.append(cmp_issue)
+            if issue_parts:
+                issue = "; ".join(issue_parts)
+                repair_prompt = self._subquestion_repair_prompt(
+                    question=question,
+                    schema=schema,
+                    wm=wm,
+                    items=items,
+                    max_steps=max_steps,
+                    min_steps=min_steps,
+                    issue_hint=issue,
+                )
+                repaired_raw = self.llm.generate(
+                    repair_prompt,
+                    meta={
+                        "rhythm": "PFC",
+                        "kind": "plan_subquestions_repair",
+                        "dataset": self.dataset_name,
+                    },
+                    temperature=0.2,
+                )
+                try:
+                    repaired_obj = extract_json_from_text(repaired_raw)
+                    repaired_items = repaired_obj.get("subquestions", [])
+                    if isinstance(repaired_items, list):
+                        items = self._sanitize_subquestion_items(repaired_items, schema)
+                except Exception:
+                    pass
+
+            # Final safeguard: ensure at least min_steps by forcing a second repair pass
+            issue_parts = []
+            if len(items) < min_steps:
+                issue_parts.append(
+                    f"still fewer than {min_steps} subquestions after repair"
+                )
+            if question_type == "comparison":
+                cmp_issue = self._validate_comparison_plan(items, candidates, min_steps)
+                if cmp_issue:
+                    issue_parts.append(cmp_issue)
+            if issue_parts:
+                issue = "; ".join(issue_parts)
+                force_prompt = self._subquestion_repair_prompt(
+                    question=question,
+                    schema=schema,
+                    wm=wm,
+                    items=items,
+                    max_steps=max_steps,
+                    min_steps=min_steps,
+                    issue_hint=issue,
+                )
+                force_raw = self.llm.generate(
+                    force_prompt,
+                    meta={
+                        "rhythm": "PFC",
+                        "kind": "plan_subquestions_force",
+                        "dataset": self.dataset_name,
+                    },
+                    temperature=0.1,
+                )
+                try:
+                    force_obj = extract_json_from_text(force_raw)
+                    force_items = force_obj.get("subquestions", [])
+                    if isinstance(force_items, list):
+                        items = self._sanitize_subquestion_items(force_items, schema)
+                except Exception:
+                    pass
+
+            # If we still only have one subquestion, explicitly split it into multiple hops
+            if len(items) < min_steps and min_steps >= 2:
+                seed_subq = items[0]["subquestion"] if items else question
+                split_prompt = self._split_single_subquestion_prompt(
+                    question=question,
+                    schema=schema,
+                    wm=wm,
+                    subquestion=seed_subq,
+                    max_steps=max_steps,
+                    min_steps=min_steps,
+                )
+                split_raw = self.llm.generate(
+                    split_prompt,
+                    meta={
+                        "rhythm": "PFC",
+                        "kind": "plan_subquestions_split",
+                        "dataset": self.dataset_name,
+                    },
+                    temperature=0.1,
+                )
+                try:
+                    split_obj = extract_json_from_text(split_raw)
+                    split_items = split_obj.get("subquestions", [])
+                    if isinstance(split_items, list):
+                        items = self._sanitize_subquestion_items(split_items, schema)
+                except Exception:
+                    pass
+
+            # Hard fallback: enforce multiple subquestions even if repairs fail
+            if len(items) < min_steps and min_steps >= 2:
+                seed_subq = items[0]["subquestion"] if items else question
+                items = self._sanitize_subquestion_items(
+                    [
+                        {"subquestion": seed_subq},
+                        {
+                            "subquestion": (
+                                f"Using the answer from the previous step, {question}"
+                            )
+                        },
+                    ],
+                    schema,
+                )
+
+            if not items:
+                items = [{"subquestion": question}]
+
+            # Build global theta memory from planned subquestions
+            global_memory = self._build_global_theta_memory(question, items, schema)
+            self._global_theta_memory = global_memory
+
+            # Extract subquestion strings
+            subquestions = [
+                str(entry.get("sub_question", "")).strip()
+                for entry in global_memory.get("sub_questions", [])
+                if isinstance(entry, dict) and str(entry.get("sub_question", "")).strip()
+            ]
+            if not subquestions:
+                subquestions = [question]
+
+            return subquestions[:max_steps]
         except Exception:
             # Fallback: still canonicalize to keep entity names stable
-            return [self._canonicalize_with_schema(question, schema)]
+            fallback_subq = self._canonicalize_with_schema(question, schema)
+            self._global_theta_memory = self._build_global_theta_memory(
+                question,
+                [fallback_subq],
+                schema,
+            )
+            return [fallback_subq]
 
     def refine_subquestion(
         self,
@@ -647,7 +1196,7 @@ Respond with JSON ONLY:
         previous_steps: List[Dict[str, Any]],
     ) -> str:
         """
-        Rewrite the planned_subquestion using earlier Gamma answers to be more specific,
+        Rewrite the planned_subquestion using earlier HPC answers to be more specific,
         while respecting the QUESTION_SCHEMA and WORKING_MEMORY (entity alignment).
         If no reliable answer yet (found=false or answer empty), keep it unchanged.
         """
@@ -656,50 +1205,43 @@ Respond with JSON ONLY:
 
         schema = self._ensure_schema(question)
         wm = self._ensure_working_memory(question)
-        schema_summary = self._schema_summary(schema)
         wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
 
-        # Summarize previous steps
-        lines = []
-        for step in previous_steps:
-            gres = step.get("gamma_result", {}) or {}
-            lines.append(
-                f"step {step.get('step_index')}: subquestion='{step.get('refined_subquestion', step.get('subquestion'))}', "
-                f"found={gres.get('found')}, answer={gres.get('answer')}"
+        found_answers = self._collect_found_answers(previous_steps)
+        if not found_answers:
+            return planned_subquestion
+        last_answer = found_answers[-1]["answer"]
+
+        history_lines = []
+        for entry in found_answers:
+            history_lines.append(
+                f"step {entry.get('step_index')}: answer='{entry.get('answer')}', "
+                f"subquestion='{entry.get('subquestion')}'"
             )
-        history_block = "\n".join(lines)
+        history_block = "\n".join(history_lines)
 
         prompt = f"""
-You are the THETA agent refining the next subquestion in a multi-hop QA task.
+You are PFC.
 
-You have WORKING_MEMORY that encodes entities as variables (E1, E2, ...),
-and QUESTION_SCHEMA that describes the overall task.
+Refine NEXT_SUBQUESTION using PREVIOUS ANSWERS so it is more specific.
 
-RULES:
-- Use QUESTION_SCHEMA and WORKING_MEMORY to preserve entity alignment and answer role.
-- When mentioning entities in the refined subquestion, ALWAYS use the exact "name"
-  from WORKING_MEMORY.entities[*].name. Do NOT change "The Game" into "the game",
-  and do NOT drop qualifiers like "(film)".
-- Use PREVIOUS STEPS (gamma answers) to rewrite the NEXT_SUBQUESTION to be as specific as possible
-  (e.g., replace pronouns like "that director" with the actual name if confidently known),
-  BUT you MUST still respect WORKING_MEMORY.entities for the canonical surface forms.
-- If previous steps did NOT find a reliable answer (found=false or empty answer), KEEP the next subquestion unchanged.
-
-QUESTION_SCHEMA_SUMMARY:
-{schema_summary}
+Rules:
+- Replace ambiguous placeholders (e.g., "that director", "that person", "that film")
+  with a concrete answer from PREVIOUS ANSWERS when relevant.
+- Use exact entity names from WORKING_MEMORY.entities for known entities.
+- If a needed answer is missing, return NEXT_SUBQUESTION unchanged.
 
 WORKING_MEMORY (authoritative, do NOT modify):
 {wm_json}
 
-PREVIOUS STEPS:
+PREVIOUS ANSWERS:
 {history_block}
 
 NEXT_SUBQUESTION (planned):
 {planned_subquestion}
 
-CRITICAL OUTPUT:
-- Respond with a SINGLE JSON object:
-  - "subquestion": string (the refined subquestion to ask gamma)
+Return JSON ONLY with:
+- "subquestion": string
 
 Respond with JSON ONLY:
 """.strip()
@@ -707,7 +1249,7 @@ Respond with JSON ONLY:
         raw_text = self.llm.generate(
             prompt,
             meta={
-                "agent": "theta",
+                "rhythm": "PFC",
                 "kind": "refine_subquestion",
                 "dataset": self.dataset_name,
             },
@@ -720,10 +1262,12 @@ Respond with JSON ONLY:
             refined = refined_raw if refined_raw else planned_subquestion
             # Canonicalize again with the schema so entity names stay unchanged
             refined = self._canonicalize_with_schema(refined, schema)
+            refined = self._replace_placeholders_with_answer(refined, last_answer)
             return refined
         except Exception:
             # Fallback: canonicalize the planned subquestion
-            return self._canonicalize_with_schema(planned_subquestion, schema)
+            fallback = self._canonicalize_with_schema(planned_subquestion, schema)
+            return self._replace_placeholders_with_answer(fallback, last_answer)
 
     # ---------- Stage 2: symbolic comparator + answer integration ----------
 
@@ -815,8 +1359,8 @@ Respond with JSON ONLY:
         gamma_summary = "\n\n".join(lines)
 
         prompt = f"""
-You are the THETA agent. You must produce a FINAL ANSWER to the ORIGINAL QUESTION
-based on GAMMA's evidence, the QUESTION_SCHEMA, and the SYMBOLIC_COMPARATOR hints.
+You are PFC. You must produce a FINAL ANSWER to the ORIGINAL QUESTION
+based on HPC's evidence, the QUESTION_SCHEMA, and the SYMBOLIC_COMPARATOR hints.
 
 STRICT RULES:
 1. Respect QUESTION_SCHEMA.answer_form:
@@ -841,7 +1385,7 @@ SYMBOLIC_COMPARATOR_HINTS:
 ORIGINAL QUESTION:
 {question}
 
-GAMMA_RESULTS:
+HPC_RESULTS:
 {gamma_summary}
 
 Respond with JSON ONLY:
@@ -850,7 +1394,7 @@ Respond with JSON ONLY:
         raw_text = self.llm.generate(
             prompt,
             meta={
-                "agent": "theta",
+                "rhythm": "PFC",
                 "kind": "integrate_answer",
                 "dataset": self.dataset_name,
             },
@@ -955,6 +1499,17 @@ Respond with JSON ONLY:
                     "skip_error_body": resp_text.strip(),
                 }
             raise
+        global_memory = self._global_theta_memory or self._build_global_theta_memory(
+            question,
+            subquestions,
+            schema,
+        )
+        memory_path = self._write_global_theta_memory(
+            global_memory,
+            dataset_name=self.dataset_name,
+            example_index=example_index,
+        )
+
         gamma_results: List[Dict[str, Any]] = []
         executed_subquestions: List[str] = []
 
@@ -973,11 +1528,11 @@ Respond with JSON ONLY:
             executed_subquestions.append(refined_subq)
             call_id = f"{ex_id}_step{step_idx}"
             gamma_call_count += 1
-            gr = self.gamma.answer_subquestion(
+            gr = self.hpc.answer_subquestion(
                 example=example,
                 subquestion=refined_subq,
                 call_id=call_id,
-                schema=schema,  # Pass schema so Gamma can prioritize titles/anchors
+                schema=schema,  # Pass schema so HPC can prioritize titles/anchors
             )
             # BridgeManager: check anchor alignment for this step and gate if needed
             bridge_meta = bridge_manager.update_step(
@@ -1024,6 +1579,8 @@ Respond with JSON ONLY:
             "working_memory": wm,
             "planned_subquestions": subquestions,
             "executed_subquestions": executed_subquestions,
+            "global_theta_memory": global_memory,
+            "global_theta_memory_path": memory_path,
             "gamma_results": gamma_results,
             "theta_final": final,              # Theta raw integration
             "theta_initial_answer": initial_answer,
@@ -1041,7 +1598,7 @@ Respond with JSON ONLY:
             "example_index": example_index,
             "id": ex_id,
             "question": question,
-            "theta_answer": initial_answer,     # Theta answer before ACC
+            "theta_answer": initial_answer,     # PFC answer before ACC
             "predicted_answer": predicted_answer,
             "theta_gamma_trace": trace,
             "llm_calls": llm_calls,
