@@ -5,8 +5,9 @@ import os
 import json
 import re
 import time
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -200,6 +201,13 @@ Respond with JSON ONLY:
         self.dataset_name = dataset_name
         self.llm = llm_client
         self._prompt_cache: Dict[str, str] = {}
+        self._bge_backend: Optional[str] = None
+        self._bge_m3 = None
+        self._bge_reranker = None
+        self._bge_m3_name = os.getenv("BGE_M3_MODEL", "BAAI/bge-m3")
+        self._bge_reranker_name = os.getenv("BGE_RERANKER_MODEL", "BAAI/bge-reranker-base")
+        self._bge_batch_size = int(os.getenv("BGE_BATCH_SIZE", "16"))
+        self._bge_max_length = int(os.getenv("BGE_MAX_LENGTH", "512"))
 
     def _get_prompt(self, name: str) -> str:
         if name in self._prompt_cache:
@@ -264,6 +272,164 @@ Respond with JSON ONLY:
                 f"[{f['idx']}] Title: {f['title']}\nText: {f['text']}"
             )
         return "\n\n".join(fact_lines)
+
+    def _ensure_bge_models(self) -> None:
+        if self._bge_backend is not None:
+            if self._bge_backend == "none":
+                raise RuntimeError(
+                    "BGE models unavailable. Install FlagEmbedding or sentence-transformers."
+                )
+            return
+
+        last_err: Optional[Exception] = None
+        try:
+            from FlagEmbedding import BGEM3FlagModel, FlagReranker
+
+            self._bge_m3 = BGEM3FlagModel(self._bge_m3_name, use_fp16=True)
+            self._bge_reranker = FlagReranker(self._bge_reranker_name, use_fp16=True)
+            self._bge_backend = "flagembedding"
+            return
+        except Exception as e:
+            last_err = e
+
+        try:
+            from sentence_transformers import SentenceTransformer, CrossEncoder
+
+            self._bge_m3 = SentenceTransformer(self._bge_m3_name)
+            self._bge_reranker = CrossEncoder(self._bge_reranker_name)
+            self._bge_backend = "sentence_transformers"
+            return
+        except Exception as e:
+            last_err = e
+
+        self._bge_backend = "none"
+        raise RuntimeError(
+            "BGE models unavailable. Install FlagEmbedding or sentence-transformers."
+        ) from last_err
+
+    def _encode_bge_texts(self, texts: List[str]) -> List[Any]:
+        self._ensure_bge_models()
+        if self._bge_backend == "flagembedding":
+            try:
+                emb = self._bge_m3.encode(
+                    texts,
+                    batch_size=self._bge_batch_size,
+                    max_length=self._bge_max_length,
+                )
+            except TypeError:
+                emb = self._bge_m3.encode(texts)
+            if isinstance(emb, dict) and "dense_vecs" in emb:
+                return list(emb["dense_vecs"])
+            return list(emb)
+
+        emb = self._bge_m3.encode(
+            texts,
+            batch_size=self._bge_batch_size,
+            normalize_embeddings=True,
+        )
+        return list(emb)
+
+    def _cosine_scores(self, query_vec: Any, doc_vecs: List[Any]) -> List[float]:
+        try:
+            import numpy as np
+
+            q = np.asarray(query_vec)
+            d = np.asarray(doc_vecs)
+            if q.ndim == 1:
+                q = q.reshape(1, -1)
+            denom = (np.linalg.norm(d, axis=1) * np.linalg.norm(q)) + 1e-8
+            scores = (d @ q.T).reshape(-1) / denom
+            return scores.tolist()
+        except Exception:
+            q = list(query_vec)
+            q_norm = math.sqrt(sum(x * x for x in q)) + 1e-8
+            scores: List[float] = []
+            for v in doc_vecs:
+                vv = list(v)
+                dot = sum(a * b for a, b in zip(q, vv))
+                v_norm = math.sqrt(sum(x * x for x in vv)) + 1e-8
+                scores.append(dot / (q_norm * v_norm))
+            return scores
+
+    def _bge_similarity_scores(self, query: str, texts: List[str]) -> List[float]:
+        if not query or not texts:
+            return []
+        vectors = self._encode_bge_texts([query] + texts)
+        if not vectors or len(vectors) < 2:
+            return [0.0 for _ in texts]
+        query_vec = vectors[0]
+        doc_vecs = vectors[1:]
+        return self._cosine_scores(query_vec, doc_vecs)
+
+    def _bge_rerank_scores(self, query: str, texts: List[str]) -> List[float]:
+        self._ensure_bge_models()
+        pairs = [[query, t] for t in texts]
+        if self._bge_backend == "flagembedding":
+            scores = self._bge_reranker.compute_score(pairs)
+        else:
+            scores = self._bge_reranker.predict(pairs)
+        return [float(s) for s in scores]
+
+    def _rerank_facts(
+        self,
+        query: str,
+        facts: List[Dict[str, Any]],
+        use_title_only: bool,
+        top_k: int,
+    ) -> Tuple[List[Dict[str, Any]], List[float]]:
+        if not facts:
+            return [], []
+        docs = []
+        for f in facts:
+            if use_title_only:
+                docs.append(str(f.get("title", "")))
+            else:
+                docs.append(f"{f.get('title', '')}. {f.get('text', '')}")
+        scores = self._bge_rerank_scores(query, docs)
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        reranked = [facts[i] for i in order[:top_k]]
+        rerank_scores = [scores[i] for i in order[:top_k]]
+        return reranked, rerank_scores
+
+    def _retrieve_topk_title_bge(
+        self,
+        facts: List[Dict[str, Any]],
+        core_entity: str,
+        top_k: int = 3,
+    ) -> Tuple[List[Dict[str, Any]], List[float], List[int]]:
+        titles = [str(f.get("title", "")) for f in facts]
+        scores = self._bge_similarity_scores(core_entity, titles)
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        top = order[:top_k]
+        candidates = [facts[i] for i in top]
+        reranked, rerank_scores = self._rerank_facts(
+            core_entity,
+            candidates,
+            use_title_only=True,
+            top_k=top_k,
+        )
+        reranked_indices = [f.get("idx") for f in reranked]
+        return reranked, rerank_scores, reranked_indices
+
+    def _retrieve_topk_context_bge(
+        self,
+        facts: List[Dict[str, Any]],
+        core_entity: str,
+        top_k: int = 3,
+    ) -> Tuple[List[Dict[str, Any]], List[float], List[int]]:
+        docs = [f"{f.get('title', '')}. {f.get('text', '')}" for f in facts]
+        scores = self._bge_similarity_scores(core_entity, docs)
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        top = order[:top_k]
+        candidates = [facts[i] for i in top]
+        reranked, rerank_scores = self._rerank_facts(
+            core_entity,
+            candidates,
+            use_title_only=False,
+            top_k=top_k,
+        )
+        reranked_indices = [f.get("idx") for f in reranked]
+        return reranked, rerank_scores, reranked_indices
 
     def _infer_answer_type(self, subquestion: str, answer: Optional[str]) -> str:
         """
@@ -483,17 +649,14 @@ Respond with JSON ONLY:
         example: Dict[str, Any],
         subquestion: str,
         call_id: str,
+        core_entity: Optional[str] = None,
         schema: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        对 2wiki / hotpotqa：仍然是“全部 facts”一次性喂给 LLM。
-        对 MusiQue：
-          - 如果能从 schema + 子问题中抽到实体锚点：
-              1) 按标题相关度对所有段落 rerank，选出 top-5 作为 primary_facts。
-              2) 用 primary_facts 做第一轮 HPC 调用。
-              3) 若未找到答案（found=False 或没选中任何 fact），
-                 再用剩余段落做第二轮 HPC 调用。
-          - 如果没有锚点，则退化为“全量 facts 一次性调用”。
+        Retrieval strategy:
+        1) title-top3 by bge-m3 similarity between core_entity and fact titles + bge-reranker.
+        2) if failed, context-top3 by bge-m3 similarity between core_entity and full fact text + bge-reranker.
+        If core_entity is empty, fall back to full-context retrieval with the subquestion.
         """
         facts = self.build_facts(example)
         if not facts:
@@ -507,62 +670,56 @@ Respond with JSON ONLY:
             }
             return self._attach_local_gamma_memory(result, subquestion, call_id)
 
-        # MusiQue: 标题优先 + 两阶段检索
-        if self.dataset_name == "musique" and schema is not None:
+        query = (core_entity or "").strip()
+        if not query and schema is not None:
             anchors = self._extract_anchors_from_schema(schema, subquestion)
             if anchors:
-                # 1) 按标题相关度打分
-                scored: List[Dict[str, Any]] = []
-                for f in facts:
-                    s = self._measure_title_relevance(f.get("title", ""), anchors)
-                    scored.append({"score": s, "fact": f})
+                query = anchors[0].strip()
+        if not query:
+            query = subquestion.strip()
 
-                scored.sort(key=lambda x: x["score"], reverse=True)
+        # Pass 1: title-top3
+        title_candidates: List[Dict[str, Any]] = []
+        title_scores: List[float] = []
+        title_order: List[int] = []
+        if query:
+        title_candidates, title_scores, title_indices = self._retrieve_topk_title_bge(
+            facts=facts,
+            core_entity=query,
+            top_k=3,
+        )
 
-                # 只保留有分数的 top-5；若全部 0 分，就按原顺序取前 5
-                primary_facts: List[Dict[str, Any]] = [
-                    item["fact"] for item in scored if item["score"] > 0
-                ][:5]
-                if not primary_facts:
-                    primary_facts = [item["fact"] for item in scored[:5]]
-
-                primary_idx_set = {f["idx"] for f in primary_facts}
-
-                # 2) 第一轮：只用 top-5 段落
-                first = self._run_gamma_once(
-                    subquestion=subquestion,
-                    candidate_facts=primary_facts,
-                    call_id=f"{call_id}_p1",
-                    all_facts=facts,
-                )
-                first["retrieval_pass"] = "primary"
-                first["retrieval_anchors"] = anchors
-                first["retrieval_primary_indices"] = sorted(primary_idx_set)
-
-                if (not first.get("found")) or (not first.get("selected_fact_indices")):
-                    # 3) 如果没找到，再用剩余段落做第二轮
-                    fallback_facts = [f for f in facts if f["idx"] not in primary_idx_set]
-                    if fallback_facts:
-                        second = self._run_gamma_once(
-                            subquestion=subquestion,
-                            candidate_facts=fallback_facts,
-                            call_id=f"{call_id}_p2",
-                            all_facts=facts,
-                        )
-                        second["retrieval_pass"] = "fallback"
-                        second["retrieval_anchors"] = anchors
-                        second["retrieval_primary_indices"] = sorted(primary_idx_set)
-                        return self._attach_local_gamma_memory(second, subquestion, call_id)
-                return self._attach_local_gamma_memory(first, subquestion, call_id)
-
-        # 默认路径：直接把所有 facts 一次性喂给 LLM（2wiki/hotpotqa 或没有锚点的 MusiQue）
-        result = self._run_gamma_once(
+        first = self._run_gamma_once(
             subquestion=subquestion,
-            candidate_facts=facts,
-            call_id=call_id,
+            candidate_facts=title_candidates if title_candidates else facts,
+            call_id=f"{call_id}_t1",
             all_facts=facts,
         )
-        return self._attach_local_gamma_memory(result, subquestion, call_id)
+        first["retrieval_pass"] = "title_top3"
+        first["retrieval_query"] = query
+        first["retrieval_candidate_indices"] = title_indices
+        first["retrieval_rerank_scores"] = title_scores
+
+        if (not first.get("found")) or (not first.get("selected_fact_indices")):
+            # Pass 2: context-top3
+            context_candidates, context_scores, context_indices = self._retrieve_topk_context_bge(
+                facts=facts,
+                core_entity=query,
+                top_k=3,
+            )
+            second = self._run_gamma_once(
+                subquestion=subquestion,
+                candidate_facts=context_candidates if context_candidates else facts,
+                call_id=f"{call_id}_t2",
+                all_facts=facts,
+            )
+            second["retrieval_pass"] = "context_top3"
+            second["retrieval_query"] = query
+            second["retrieval_candidate_indices"] = context_indices
+            second["retrieval_rerank_scores"] = context_scores
+            return self._attach_local_gamma_memory(second, subquestion, call_id)
+
+        return self._attach_local_gamma_memory(first, subquestion, call_id)
 
 
 ACTION_KEEP = "KEEP"

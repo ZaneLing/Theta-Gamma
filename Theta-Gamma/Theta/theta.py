@@ -1512,10 +1512,16 @@ Respond with JSON ONLY:
 
         gamma_results: List[Dict[str, Any]] = []
         executed_subquestions: List[str] = []
+        memory_items = global_memory.get("sub_questions", []) if isinstance(global_memory, dict) else []
 
         gamma_call_count = 0
         gamma_success_count = 0
         for step_idx, subq in enumerate(subquestions, start=1):
+            core_entity = ""
+            if isinstance(memory_items, list) and (step_idx - 1) < len(memory_items):
+                entry = memory_items[step_idx - 1]
+                if isinstance(entry, dict):
+                    core_entity = str(entry.get("core_entity", "")).strip()
             refined_subq = (
                 self.refine_subquestion(
                     question=question,
@@ -1532,6 +1538,7 @@ Respond with JSON ONLY:
                 example=example,
                 subquestion=refined_subq,
                 call_id=call_id,
+                core_entity=core_entity,
                 schema=schema,  # Pass schema so HPC can prioritize titles/anchors
             )
             # BridgeManager: check anchor alignment for this step and gate if needed
@@ -1548,6 +1555,7 @@ Respond with JSON ONLY:
                     "step_index": step_idx,
                     "subquestion": subq,
                     "refined_subquestion": refined_subq,
+                    "core_entity": core_entity,
                     "gamma_result": gr,
                     "bridge": bridge_meta,
                 }
