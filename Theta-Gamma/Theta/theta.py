@@ -1,6 +1,5 @@
 # theta_gpt35.py
-# PFC: orchestrates HPC calls, applies ACC self-check,
-# question schema + slot graph, and returns trace.
+# PFC: orchestrates HPC calls, question schema + slot graph, and returns trace.
 
 from typing import Any, Dict, List, Optional
 import re
@@ -9,204 +8,20 @@ from pathlib import Path
 import os
 from requests.exceptions import HTTPError, SSLError, ConnectionError, Timeout
 
-from gamma_gpt35 import LLMClient, HPC, ACC, extract_json_from_text
+from gamma_gpt35 import LLMClient, HPC, extract_json_from_text
 from dotenv import load_dotenv
 load_dotenv()
-
-class BridgeManager:
-    """
-    BridgeManager: lightweight anchor-alignment checker.
-
-    Goals:
-    - Use entities from the question schema plus explicit entity answers from earlier
-      HPC steps as anchors for each subquestion.
-    - Check whether HPC-selected facts actually mention these anchors.
-    - If a subquestion clearly depends on anchors but the selected facts do not mention
-      them, treat the bridge as unreliable: set bridge_ok=False and found=False (gating).
-
-    Output:
-    - Per-step metadata:
-      {
-        "step_index": int,
-        "anchors": [...],
-        "matched_anchors": [...],
-        "bridge_ok": bool,
-        "bridge_reason": str
-      }
-    - trace["bridge_manager"] includes a summary for logging/analysis.
-    """
-
-    def __init__(self, question: str, schema: Dict[str, Any]):
-        self.question = question
-        self.schema = schema or {}
-        # Extract explicit entity names (and aliases if present) from the schema
-        self.schema_anchor_map: Dict[str, str] = self._extract_schema_anchors(schema)
-        self.schema_entities: List[str] = list(self.schema_anchor_map.values())
-        # Entity-style answers from previous HPC steps
-        self.prev_answers: List[str] = []
-        # Bridge metadata per step
-        self.steps: List[Dict[str, Any]] = []
-
-    def _extract_schema_anchors(self, schema: Dict[str, Any]) -> Dict[str, str]:
-        """
-        Build a canonical anchor map from schema.entities:
-        key = lowercase surface form or alias; value = canonical surface form.
-        """
-        anchors: Dict[str, str] = {}
-        for e in schema.get("entities", []) or []:
-            name = (e.get("name") or "").strip()
-            aliases = e.get("aliases") or e.get("alias") or []
-            if isinstance(aliases, str):
-                aliases = [aliases]
-            forms = [name] if name else []
-            forms.extend([(a or "").strip() for a in aliases])
-            for form in forms:
-                if not form:
-                    continue
-                key = form.lower()
-                # prefer the longest surface form as canonical if conflicts
-                if key not in anchors or len(form) > len(anchors[key]):
-                    anchors[key] = form
-        return anchors
-
-    def _extract_anchors_for_subquestion(self, subq: str) -> List[str]:
-        """
-        Extract anchor entities for the current refined_subquestion:
-        - entity names from the schema that appear in this subquestion
-        - explicit answers from previous steps that appear in this subquestion
-        """
-        anchors = set()
-        sq_lower = (subq or "").lower()
-
-        # Schema entities (canonicalized)
-        for key, canonical in self.schema_anchor_map.items():
-            if key and key in sq_lower:
-                anchors.add(canonical)
-
-        # Previous answers as potential intermediate anchors
-        for ans in self.prev_answers:
-            a = ans.strip()
-            if a and a.lower() in sq_lower:
-                anchors.add(a)
-
-        return list(anchors)
-
-    def update_step(
-        self,
-        step_index: int,
-        refined_subq: str,
-        gamma_result: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Run after each HPC step:
-        - extract anchors from refined_subq
-        - check whether selected_fact_texts mention these anchors
-        - if anchors exist but none are matched:
-            - set bridge_ok=False
-            - annotate gamma_result["reasoning"]
-            - force gamma_result["found"]=False (gating)
-        - if this step is still found and answer is a string, save the answer for later steps
-        """
-        anchors = self._extract_anchors_for_subquestion(refined_subq)
-        selected_texts = gamma_result.get("selected_fact_texts") or []
-        big_text = " ".join(str(t) for t in selected_texts).lower()
-        matched_anchors: List[str] = []
-        if big_text:
-            matched_anchors = [a for a in anchors if a.lower() in big_text]
-
-        bridge_ok = True
-        bridge_reason = ""
-
-        if anchors:
-            if gamma_result.get("found"):
-                if not matched_anchors:
-                    # Clear anchors exist but selected facts never mention them: gate this step
-                    bridge_ok = False
-                    bridge_reason = (
-                        "HPC selected facts do not mention any anchor entities from "
-                        "schema/previous answers."
-                    )
-                    gamma_result["found"] = False
-                    gamma_result.setdefault("reasoning", "")
-                    if "BridgeManager" not in gamma_result["reasoning"]:
-                        gamma_result["reasoning"] += (
-                            " [BridgeManager: anchor entities not found in selected facts; "
-                            "treat as not found]"
-                        )
-            else:
-                # No answer found and the subquestion has anchors -> bridge broken here
-                bridge_ok = False
-                bridge_reason = (
-                    "HPC could not find an answer for a subquestion that depends on "
-                    "anchor entities."
-                )
-        else:
-            # No anchors detected: pass through without gating
-            bridge_ok = True
-            bridge_reason = ""
-
-        # Track entity answers still treated as found for later steps
-        ans = gamma_result.get("answer")
-        if gamma_result.get("found") and isinstance(ans, str) and ans.strip():
-            self.prev_answers.append(ans.strip())
-            # Trim history to avoid unbounded growth
-            if len(self.prev_answers) > 6:
-                self.prev_answers = self.prev_answers[-6:]
-
-        meta = {
-            "step_index": step_index,
-            "anchors": anchors,
-            "matched_anchors": matched_anchors,
-            "bridge_ok": bridge_ok,
-            "bridge_reason": bridge_reason,
-        }
-        self.steps.append(meta)
-        return meta
-
-    def summary(self) -> str:
-        """
-        Return a short summary for logs/prompts.
-        """
-        if not self.steps:
-            return "BridgeManager: no steps recorded."
-        lines: List[str] = []
-        bad = 0
-        for s in self.steps:
-            ok = bool(s.get("bridge_ok", True))
-            if not ok:
-                bad += 1
-            lines.append(
-                f"step {s.get('step_index')}: bridge_ok={ok}, "
-                f"anchors={s.get('anchors')}, matched={s.get('matched_anchors')}, "
-                f"reason={s.get('bridge_reason')}"
-            )
-        if bad == 0:
-            head = "BridgeManager summary: all steps passed anchor-entity bridge checks."
-        else:
-            head = (
-                f"BridgeManager summary: {bad}/{len(self.steps)} steps had weak or "
-                f"missing anchor-entity alignment."
-            )
-        return head + "\n" + "\n".join(lines)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "question": self.question,
-            "schema_entities": list(self.schema_entities),
-            "steps": list(self.steps),
-            "summary": self.summary(),
-        }
-
 
 class PFC:
     """
     PFC:
     - Question schema analysis (task type, answer role, entities)
-    - Plan subquestions (theta)
+    - Decompose the main question into step-by-step subquestions
+    - Repair the current subquestion without changing earlier steps
+    - Replan the entire framework from a different path when needed
     - Dispatch gamma as needed
     - Dynamically rewrite later subquestions using previous answers
     - Integrate the final answer (with symbolic comparator hints)
-    - Call ACC for lightweight self-check
     - Return full trace (for logging / analysis)
     """
 
@@ -218,19 +33,15 @@ class PFC:
     ):
         assert dataset_name in {"2wiki", "hotpotqa", "musique"}
         self.dataset_name = dataset_name
-        # HPC / ACC stay on the baseline llm_client; theta can optionally use
+        # HPC stays on the baseline llm_client; theta can optionally use
         # a separate client (e.g., Ollama) for planning/answering.
         self.gamma_llm = llm_client
         self.theta_llm = theta_llm_client or llm_client
         self._apply_openrouter_config(self.gamma_llm)
         if self.theta_llm is not self.gamma_llm:
             self._apply_openrouter_config(self.theta_llm)
-        self.acc = ACC(dataset_name=dataset_name, llm_client=self.gamma_llm)
         self.llm = self.theta_llm
         self.hpc = HPC(dataset_name=dataset_name, llm_client=self.gamma_llm)
-
-        # BridgeManager class (kept swappable for future implementations)
-        self.bridge_manager_cls = BridgeManager
 
         # Cache the schema per question to avoid recomputation
         self._schema_question: Optional[str] = None
@@ -882,7 +693,7 @@ class PFC:
             )
         return sanitized
 
-    def _subquestion_repair_prompt(
+    def _plan_repair_prompt(
         self,
         question: str,
         schema: Dict[str, Any],
@@ -978,31 +789,38 @@ Return JSON ONLY with:
 Respond with JSON ONLY:
 """.strip()
 
-    # ---------- Stage 1: theta decomposes the question ----------
-
-    def plan_subquestions(self, question: str, max_steps: int = 4) -> List[str]:
-        # Ensure schema & working memory are prepared
-        schema = self._ensure_schema(question)
-        wm = self._ensure_working_memory(question)
+    def _repair_current_subquestion_prompt(
+        self,
+        question: str,
+        schema: Dict[str, Any],
+        wm: Dict[str, Any],
+        current_subquestion: str,
+        previous_answers_block: str,
+        max_steps: int,
+        min_steps: int,
+    ) -> str:
         wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
-        question_type = (schema.get("question_type") or "other").strip().lower()
-        min_steps = 2 if max_steps >= 2 else max_steps
-        if question_type == "comparison":
-            min_steps = max(min_steps, 3)
         type_guidance = self._type_guidance(schema, wm)
         type_block = f"\n{type_guidance}\n" if type_guidance else ""
 
-        prompt = f"""
+        return f"""
 You are PFC.
 
-Decompose the ORIGINAL QUESTION into {min_steps} to {max_steps} ordered, step-by-step subquestions.
-Each subquestion should ask for one missing fact. Do NOT answer the question.
+Repair ONLY the CURRENT_SUBQUESTION by splitting it into {min_steps} to {max_steps}
+ordered, step-by-step subquestions. Previous steps must remain unchanged.
 
 Rules:
-- Use exact entity names from WORKING_MEMORY.entities when referring to known entities.
-- If a step depends on a previous answer, you may use a short placeholder (e.g., "that person").
-- The last subquestion should enable the final answer.
+- Each subquestion should ask for one missing fact.
+- Use exact entity names from WORKING_MEMORY.entities for known entities.
+- If a step depends on a previous answer, you may use that answer directly.
+- Avoid re-asking any fact already answered in PREVIOUS ANSWERS.
 {type_block}
+
+PREVIOUS ANSWERS (fixed, do NOT repeat):
+{previous_answers_block}
+
+CURRENT_SUBQUESTION:
+{current_subquestion}
 
 QUESTION_SCHEMA_JSON:
 {json.dumps(schema, ensure_ascii=False, indent=2)}
@@ -1022,11 +840,70 @@ Return JSON ONLY with:
 Respond with JSON ONLY:
 """.strip()
 
+    def _replan_prompt(
+        self,
+        question: str,
+        schema: Dict[str, Any],
+        wm: Dict[str, Any],
+        current_plan_block: str,
+        max_steps: int,
+        min_steps: int,
+    ) -> str:
+        wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
+        type_guidance = self._type_guidance(schema, wm)
+        type_block = f"\n{type_guidance}\n" if type_guidance else ""
+
+        return f"""
+You are PFC.
+
+Replan the entire multi-hop approach from scratch. You may change any previous steps.
+Produce {min_steps} to {max_steps} ordered, step-by-step subquestions.
+
+Rules:
+- Each subquestion should ask for one missing fact.
+- Use exact entity names from WORKING_MEMORY.entities for known entities.
+- The last subquestion should enable the final answer.
+{type_block}
+
+CURRENT_PLAN (for reference, you may discard it):
+{current_plan_block}
+
+QUESTION_SCHEMA_JSON:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+WORKING_MEMORY (authoritative, do NOT modify):
+{wm_json}
+
+ORIGINAL QUESTION:
+{question}
+
+Return JSON ONLY with:
+- "subquestions": array of {min_steps} to {max_steps} objects:
+  - "subquestion": string
+  - "core_entity": string (use WORKING_MEMORY.entities[*].name when applicable)
+  - "expected_answer_type": string (e.g., person, location, date, number, film, organization)
+
+Respond with JSON ONLY:
+""".strip()
+
+    # ---------- Stage 1: decomposition / repair / replan ----------
+
+    def _generate_subquestions_from_prompt(
+        self,
+        question: str,
+        schema: Dict[str, Any],
+        wm: Dict[str, Any],
+        prompt: str,
+        max_steps: int,
+        min_steps: int,
+        question_type: str,
+        kind: str,
+    ) -> List[str]:
         raw_text = self.llm.generate(
             prompt,
             meta={
                 "rhythm": "PFC",
-                "kind": "plan_subquestions",
+                "kind": kind,
                 "dataset": self.dataset_name,
             },
             temperature=0.3,
@@ -1055,7 +932,7 @@ Respond with JSON ONLY:
                     issue_parts.append(cmp_issue)
             if issue_parts:
                 issue = "; ".join(issue_parts)
-                repair_prompt = self._subquestion_repair_prompt(
+                repair_prompt = self._plan_repair_prompt(
                     question=question,
                     schema=schema,
                     wm=wm,
@@ -1068,7 +945,7 @@ Respond with JSON ONLY:
                     repair_prompt,
                     meta={
                         "rhythm": "PFC",
-                        "kind": "plan_subquestions_repair",
+                        "kind": f"{kind}_repair",
                         "dataset": self.dataset_name,
                     },
                     temperature=0.2,
@@ -1093,7 +970,7 @@ Respond with JSON ONLY:
                     issue_parts.append(cmp_issue)
             if issue_parts:
                 issue = "; ".join(issue_parts)
-                force_prompt = self._subquestion_repair_prompt(
+                force_prompt = self._plan_repair_prompt(
                     question=question,
                     schema=schema,
                     wm=wm,
@@ -1106,7 +983,7 @@ Respond with JSON ONLY:
                     force_prompt,
                     meta={
                         "rhythm": "PFC",
-                        "kind": "plan_subquestions_force",
+                        "kind": f"{kind}_force",
                         "dataset": self.dataset_name,
                     },
                     temperature=0.1,
@@ -1134,7 +1011,7 @@ Respond with JSON ONLY:
                     split_prompt,
                     meta={
                         "rhythm": "PFC",
-                        "kind": "plan_subquestions_split",
+                        "kind": f"{kind}_split",
                         "dataset": self.dataset_name,
                     },
                     temperature=0.1,
@@ -1188,6 +1065,204 @@ Respond with JSON ONLY:
                 schema,
             )
             return [fallback_subq]
+
+    # 1) Decomposition: break the main question into ordered subquestions
+    def decompose_question(self, question: str, max_steps: int = 4) -> List[str]:
+        # Ensure schema & working memory are prepared
+        schema = self._ensure_schema(question)
+        wm = self._ensure_working_memory(question)
+        wm_json = json.dumps(wm, ensure_ascii=False, indent=2)
+        question_type = (schema.get("question_type") or "other").strip().lower()
+        min_steps = 2 if max_steps >= 2 else max_steps
+        if question_type == "comparison":
+            min_steps = max(min_steps, 3)
+        type_guidance = self._type_guidance(schema, wm)
+        type_block = f"\n{type_guidance}\n" if type_guidance else ""
+
+        prompt = f"""
+You are PFC.
+
+Decompose the ORIGINAL QUESTION into {min_steps} to {max_steps} ordered, step-by-step subquestions.
+Each subquestion should ask for one missing fact. Do NOT answer the question.
+
+Rules:
+- Use exact entity names from WORKING_MEMORY.entities when referring to known entities.
+- If a step depends on a previous answer, you may use a short placeholder (e.g., "that person").
+- The last subquestion should enable the final answer.
+{type_block}
+
+QUESTION_SCHEMA_JSON:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+WORKING_MEMORY (authoritative, do NOT modify):
+{wm_json}
+
+ORIGINAL QUESTION:
+{question}
+
+Return JSON ONLY with:
+- "subquestions": array of {min_steps} to {max_steps} objects:
+  - "subquestion": string
+  - "core_entity": string (use WORKING_MEMORY.entities[*].name when applicable)
+  - "expected_answer_type": string (e.g., person, location, date, number, film, organization)
+
+Respond with JSON ONLY:
+""".strip()
+
+        return self._generate_subquestions_from_prompt(
+            question=question,
+            schema=schema,
+            wm=wm,
+            prompt=prompt,
+            max_steps=max_steps,
+            min_steps=min_steps,
+            question_type=question_type,
+            kind="decompose_question",
+        )
+
+    def plan_subquestions(self, question: str, max_steps: int = 4) -> List[str]:
+        """
+        Backward-compatible alias for decompose_question.
+        """
+        return self.decompose_question(question, max_steps=max_steps)
+
+    # 2) Repair: split the current subquestion into finer-grained steps
+    def repair_subquestion(
+        self,
+        question: str,
+        current_subquestion: str,
+        previous_steps: Optional[List[Dict[str, Any]]] = None,
+        max_steps: int = 3,
+    ) -> List[str]:
+        """
+        Repair only the current subquestion by splitting it into finer-grained steps.
+        Previous steps remain unchanged.
+        """
+        schema = self._ensure_schema(question)
+        wm = self._ensure_working_memory(question)
+        min_steps = 2 if max_steps >= 2 else max_steps
+
+        prev = previous_steps or []
+        found_answers = self._collect_found_answers(prev)
+        if found_answers:
+            history_lines = [
+                f"step {entry.get('step_index')}: answer='{entry.get('answer')}', "
+                f"subquestion='{entry.get('subquestion')}'"
+                for entry in found_answers
+            ]
+            history_block = "\n".join(history_lines)
+        else:
+            history_block = "(none)"
+
+        prompt = self._repair_current_subquestion_prompt(
+            question=question,
+            schema=schema,
+            wm=wm,
+            current_subquestion=current_subquestion,
+            previous_answers_block=history_block,
+            max_steps=max_steps,
+            min_steps=min_steps,
+        )
+
+        raw_text = self.llm.generate(
+            prompt,
+            meta={
+                "rhythm": "PFC",
+                "kind": "repair_subquestion",
+                "dataset": self.dataset_name,
+            },
+            temperature=0.2,
+        )
+
+        items: List[Dict[str, str]] = []
+        try:
+            obj = extract_json_from_text(raw_text)
+            raw_items = obj.get("subquestions", [])
+            if isinstance(raw_items, list):
+                items = self._sanitize_subquestion_items(raw_items, schema)
+        except Exception:
+            items = []
+
+        if len(items) < min_steps:
+            split_prompt = self._split_single_subquestion_prompt(
+                question=question,
+                schema=schema,
+                wm=wm,
+                subquestion=current_subquestion,
+                max_steps=max_steps,
+                min_steps=min_steps,
+            )
+            split_raw = self.llm.generate(
+                split_prompt,
+                meta={
+                    "rhythm": "PFC",
+                    "kind": "repair_subquestion_split",
+                    "dataset": self.dataset_name,
+                },
+                temperature=0.1,
+            )
+            try:
+                split_obj = extract_json_from_text(split_raw)
+                split_items = split_obj.get("subquestions", [])
+                if isinstance(split_items, list):
+                    items = self._sanitize_subquestion_items(split_items, schema)
+            except Exception:
+                pass
+
+        if not items:
+            items = [{"subquestion": current_subquestion}]
+
+        subquestions = [
+            str(item.get("subquestion", "")).strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("subquestion", "")).strip()
+        ]
+        if not subquestions:
+            subquestions = [current_subquestion]
+
+        return subquestions[:max_steps]
+
+    # 3) Replan: rebuild the full framework from a different path
+    def replan_subquestions(
+        self,
+        question: str,
+        current_plan: Optional[List[str]] = None,
+        max_steps: int = 4,
+    ) -> List[str]:
+        """
+        Replan the full multi-hop framework; earlier steps can be replaced.
+        """
+        schema = self._ensure_schema(question)
+        wm = self._ensure_working_memory(question)
+        question_type = (schema.get("question_type") or "other").strip().lower()
+        min_steps = 2 if max_steps >= 2 else max_steps
+        if question_type == "comparison":
+            min_steps = max(min_steps, 3)
+
+        if current_plan:
+            current_plan_block = "\n".join(f"- {s}" for s in current_plan)
+        else:
+            current_plan_block = "(none)"
+
+        prompt = self._replan_prompt(
+            question=question,
+            schema=schema,
+            wm=wm,
+            current_plan_block=current_plan_block,
+            max_steps=max_steps,
+            min_steps=min_steps,
+        )
+
+        return self._generate_subquestions_from_prompt(
+            question=question,
+            schema=schema,
+            wm=wm,
+            prompt=prompt,
+            max_steps=max_steps,
+            min_steps=min_steps,
+            question_type=question_type,
+            kind="replan_subquestions",
+        )
 
     def refine_subquestion(
         self,
@@ -1472,12 +1547,9 @@ Respond with JSON ONLY:
             raise
         schema_summary = self._schema_summary(schema)  # logging only
 
-        # Initialize BridgeManager
-        bridge_manager = self.bridge_manager_cls(question=question, schema=schema)
-
         # 1) theta: plan subquestions
         try:
-            subquestions = self.plan_subquestions(question)
+            subquestions = self.decompose_question(question)
         except Exception as e:
             status = None
             resp_text = ""
@@ -1493,8 +1565,8 @@ Respond with JSON ONLY:
                     "example_index": example_index,
                     "question": question,
                     "skipped": True,
-                    "skip_stage": "plan_subquestions",
-                    "skip_reason": f"Planning failed: {e}",
+                    "skip_stage": "decompose_question",
+                    "skip_reason": f"Decomposition failed: {e}",
                     "skip_error_status": status,
                     "skip_error_body": resp_text.strip(),
                 }
@@ -1541,12 +1613,6 @@ Respond with JSON ONLY:
                 core_entity=core_entity,
                 schema=schema,  # Pass schema so HPC can prioritize titles/anchors
             )
-            # BridgeManager: check anchor alignment for this step and gate if needed
-            bridge_meta = bridge_manager.update_step(
-                step_index=step_idx,
-                refined_subq=refined_subq,
-                gamma_result=gr,
-            )
 
             if gr.get("found"):
                 gamma_success_count += 1
@@ -1557,7 +1623,6 @@ Respond with JSON ONLY:
                     "refined_subquestion": refined_subq,
                     "core_entity": core_entity,
                     "gamma_result": gr,
-                    "bridge": bridge_meta,
                 }
             )
 
@@ -1572,13 +1637,7 @@ Respond with JSON ONLY:
             initial_answer = str(initial_answer)
         initial_answer = initial_answer.strip()
 
-        # 4) ACC self-check: detect logical/entity issues and optionally revise
-        acc_result = self.acc.check_answer(
-            question=question,
-            gamma_results=gamma_results,
-            initial_answer=initial_answer,
-        )
-        predicted_answer = acc_result.get("final_answer", "") or initial_answer
+        predicted_answer = initial_answer
 
         # 5) trace + log
         trace = {
@@ -1592,11 +1651,9 @@ Respond with JSON ONLY:
             "gamma_results": gamma_results,
             "theta_final": final,              # Theta raw integration
             "theta_initial_answer": initial_answer,
-            "acc_result": acc_result,          # ACC self-check details
             "gamma_call_count": gamma_call_count,
             "gamma_success_count": gamma_success_count,
             "symbolic_comparator": comparator,
-            "bridge_manager": bridge_manager.to_dict(),
         }
 
         llm_calls = getattr(self.llm, "call_log", [])
@@ -1606,7 +1663,7 @@ Respond with JSON ONLY:
             "example_index": example_index,
             "id": ex_id,
             "question": question,
-            "theta_answer": initial_answer,     # PFC answer before ACC
+            "theta_answer": initial_answer,
             "predicted_answer": predicted_answer,
             "theta_gamma_trace": trace,
             "llm_calls": llm_calls,
