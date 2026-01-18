@@ -1,6 +1,9 @@
 from typing import List
 
-from metrics_gpt35_em import normalize_answer
+try:
+    from Evaluation.metrics_em import normalize_answer
+except ImportError:
+    from metrics_em import normalize_answer
 
 
 def answer_f1(pred: str, golds: List[str]) -> float:

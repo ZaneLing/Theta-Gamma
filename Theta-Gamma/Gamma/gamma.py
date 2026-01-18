@@ -263,7 +263,7 @@ Respond with JSON ONLY:
             return self._build_facts_musique(example)
         raise ValueError(f"Unknown dataset: {self.dataset_name}")
 
-    # ---------- 内部工具：构造 facts_block 并调用一次 LLM ----------
+    # ---------- Internal tool: build facts_block and call LLM once ----------
 
     def _build_facts_block(self, facts: List[Dict[str, Any]]) -> str:
         fact_lines: List[str] = []
@@ -759,7 +759,7 @@ Respond with JSON ONLY:
             name = (e.get("name") or "").strip()
             if not name:
                 continue
-            # 只把真的在子问题里出现的实体，当做当前子问题的锚点
+            # Only treat entities that appear in the subquestion as anchors
             if name.lower() in sq_lower:
                 anchors.append(name)
         return anchors
